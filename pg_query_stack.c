@@ -503,23 +503,6 @@ _PG_fini(void)
     // Отвязка от колбэка под-транзакции
     UnregisterSubXactCallback(pg_query_stack_subxact_callback, NULL);
     
-    /*
-        Если модуль выгружается в то время, когда стек запросов не пуст, может произойти утечка памяти или некорректное освобождение ресурсов.
-        Поэтому чистим его сами если вдруг он не пуст.
-    */
-    if (query_stack != NIL)
-    {
-        ListCell *lc;
-        foreach(lc, query_stack)
-        {
-            QueryStackEntry *entry = (QueryStackEntry *) lfirst(lc);
-            pfree(entry->query);
-            pfree(entry);
-        }
-        list_free(query_stack);
-        query_stack = NIL;
-    }
-    
     // Освобождаем созданный контекст памяти
     if (pg_query_stack_context)
         MemoryContextDelete(pg_query_stack_context);
