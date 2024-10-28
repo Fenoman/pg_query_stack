@@ -180,6 +180,7 @@ $$
 $$
 LANGUAGE SQL;
 ```
+At the moment, it is automatically created when the extension is installed.
 
 ## License
 
