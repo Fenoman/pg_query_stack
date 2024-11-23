@@ -221,7 +221,7 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         */
         if (Query_Stack != NIL)
         {
-            List       *stack_copy = NIL;
+            stack_copy = NIL;
             ListCell   *lc;
             
             foreach(lc, Query_Stack)
