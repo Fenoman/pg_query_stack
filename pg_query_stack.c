@@ -30,7 +30,7 @@ static List *Query_Stack = NIL;
 // Структура для хранения копии запроса
 typedef struct QueryStackEntry
 {
-    char *query_text;
+    const char *query_text;
 } QueryStackEntry;
 
 
@@ -154,11 +154,11 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
 {
     PG_TRY();
     {
-        // Сначала вызываем предыдущие хуки 
-        if (prev_ExecutorEnd)
-            prev_ExecutorEnd(queryDesc);
-        else
-            standard_ExecutorEnd(queryDesc);
+    // Сначала вызываем предыдущие хуки 
+    if (prev_ExecutorEnd)
+        prev_ExecutorEnd(queryDesc);
+    else
+        standard_ExecutorEnd(queryDesc);
     }
     PG_CATCH();
     {
@@ -169,7 +169,7 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
         PG_RE_THROW();
     }
     PG_END_TRY();
-    
+        
     // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
     pg_stack_free();
 }
@@ -221,12 +221,37 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         */
         if (Query_Stack != NIL)
         {
-            stack_copy = list_copy(Query_Stack);
-
+            List       *stack_copy = NIL;
+            ListCell   *lc;
+            
+            foreach(lc, Query_Stack)
+            {
+                QueryStackEntry *orig_entry = (QueryStackEntry *) lfirst(lc);
+                QueryStackEntry *copy_entry;
+        
+                // Выделяем память под новый QueryStackEntry в multi_call_memory_ctx
+                copy_entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
+        
+                // Копируем query_text
+                if (orig_entry->query_text)
+                    copy_entry->query_text = pstrdup(orig_entry->query_text);
+                else
+                    copy_entry->query_text = pstrdup("<unnamed query>");
+        
+                // Добавляем копию в наш список
+                stack_copy = lappend(stack_copy, copy_entry);
+            }
+            
             // Пропускаем указанное количество элементов
             while (depth < skip_count && stack_copy != NIL)
             {
+                QueryStackEntry *entry = (QueryStackEntry *) linitial(stack_copy);
+        
+                // Освобождаем память под query_text и структуру, так как они больше не нужны
+                pfree(entry->query_text);
+                pfree(entry);
                 stack_copy = list_delete_first(stack_copy);
+                
                 depth++;
             }
 
