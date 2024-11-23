@@ -70,22 +70,15 @@ pg_stack_free(void)
 {
     if (Query_Stack != NIL)
     {
-        MemoryContext oldcontext;
-
-        // Переключаемся на TopMemoryContext
-        oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-
         QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
 
         if (entry->query_text)
             pfree(entry->query_text);
         pfree(entry);
 
-        // Возвращаемся к предыдущему контексту
-        MemoryContextSwitchTo(oldcontext);
-
         Query_Stack = list_delete_first(Query_Stack);
-    }}
+    }
+}
 
 /* Загрузка расширения в память */
 void
@@ -120,9 +113,20 @@ static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
     MemoryContext oldcontext;
-
-    // Переключаемся на TopMemoryContext
-    oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+    
+    /*
+        CurTransactionContext
+        * Живет в течение одной открытой транзакции.
+        * Уничтожается при завершении транзакции (COMMIT или ROLLBACK).
+        * Уменьшение использования TopMemoryContext, что снижает риск утечек памяти при ошибках. 
+        * Создание и очистка CurTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
+    */
+    if (CurTransactionContext != NULL)
+        // Если контекст транзакции существует то переключаемся на него
+        oldcontext = MemoryContextSwitchTo(CurTransactionContext);
+    else    
+        // Иначе используем контекст сессии (подстраховка)
+        oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 
     // Создаём новый элемент стека
     QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
