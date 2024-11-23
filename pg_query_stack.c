@@ -27,6 +27,13 @@ PG_MODULE_MAGIC;
 */
 static List *Query_Stack = NIL;
 
+// Структура для хранения копии запроса
+typedef struct QueryStackEntry
+{
+    char *query_text;
+} QueryStackEntry;
+
+
 // Прототипы функций инициализации расширения и выгрузки
 void _PG_init(void);
 void _PG_fini(void);
@@ -55,6 +62,25 @@ pg_list_reverse_copy(List *list)
     }
 
     return reversed;
+}
+
+// Освобождение памяти
+static void
+pg_stack_free(void)
+{
+    if (Query_Stack != NIL)
+    {
+        QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
+
+        if (entry->query_text)
+            // Освобождаем память выделенную под строку
+            pfree(entry->query_text);
+        // Освобождаем память выделенную под структуру
+        pfree(entry);
+        
+        // Удаляем текущий Query_Desc из списка
+        Query_Stack = list_delete_first(Query_Stack);
+    }
 }
 
 /* Загрузка расширения в память */
@@ -89,9 +115,18 @@ _PG_fini(void)
 static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-    // Добавляем текущий QueryDesc в стек
-    Query_Stack = lcons(queryDesc, Query_Stack);
+    // Создаём новый элемент стека
+    QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
 
+    // Копируем sourceText
+    if (queryDesc->sourceText)
+        entry->query_text = pstrdup(queryDesc->sourceText);
+    else
+        entry->query_text = pstrdup("<unnamed query>");
+
+    // Добавляем запись в наш стек
+    Query_Stack = lcons(entry, Query_Stack);
+    
     PG_TRY();
     {
         // Далее вызываем следующий хук или стандартную функцию
@@ -102,8 +137,9 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     }
     PG_CATCH();
     {
-        // Убираем текущий QueryDesc из стека при ошибке
-        Query_Stack = list_delete_first(Query_Stack);
+        // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
+        pg_stack_free();
+        
         // Заново прокидываем ошибку
         PG_RE_THROW();
     }
@@ -126,15 +162,16 @@ pg_query_stack_ExecutorFinish(QueryDesc *queryDesc)
     }
     PG_CATCH();
     {
-        // Убираем текущий QueryDesc из стека при ошибке
-        Query_Stack = list_delete_first(Query_Stack);
+        // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
+        pg_stack_free();
+    
         // Заново прокидываем ошибку
         PG_RE_THROW();
     }
     PG_END_TRY();
-
-    // Убираем текущий QueryDesc из стека
-    Query_Stack = list_delete_first(Query_Stack);
+    
+    // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
+    pg_stack_free();
 }
 
 /*
@@ -270,14 +307,14 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         /* 
             Получаем элемент стека запросов, соответствующий текущему номеру вызова:
             - list_nth(stack, call_cntr); возвращает call_cntr-й элемент списка stack
-            - Приводим возвращенный указатель к `QueryDesc *`, чтобы работать с его полями
+            - Приводим возвращенный указатель к `QueryStackEntry *`, чтобы работать с его полями
         */
-        QueryDesc       *queryDesc = (QueryDesc *) list_nth(stack, call_cntr);
+        QueryStackEntry *entry = (QueryStackEntry *) list_nth(stack, call_cntr);
         
         // Уровень вложенности запроса
         int frame_number = call_cntr;
         // Получаем текст запроса
-        const char *query_text = queryDesc->sourceText;
+        const char *query_text = entry->query_text;
 
         // Подстраховка, если вдруг запрос не получен
         if (query_text == NULL || query_text[0] == '\0')
