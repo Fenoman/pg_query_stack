@@ -40,14 +40,14 @@ void _PG_fini(void);
 
 // Прототипы хуков
 static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
-static void pg_query_stack_ExecutorFinish(QueryDesc *queryDesc);
+static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 
 // Прототип нашей функции получения стека запросов
 Datum pg_query_stack(PG_FUNCTION_ARGS);
 
 // Сюда сохраняем предыдущие хуки для их восстановления при выгрузке расширения
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
-static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 // Собственная реализация функции переворота списка, так как внутренняя list_reverse не доступна для модулей
 static List *
@@ -90,8 +90,8 @@ _PG_init(void)
     prev_ExecutorStart = ExecutorStart_hook;
     ExecutorStart_hook = pg_query_stack_ExecutorStart;
 
-    prev_ExecutorFinish = ExecutorFinish_hook;
-    ExecutorFinish_hook = pg_query_stack_ExecutorFinish;
+    prev_ExecutorEnd = ExecutorEnd_hook;
+    ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
 }
 
 /* Выгрузка расширения из памяти */
@@ -99,7 +99,7 @@ void
 _PG_fini(void)
 {
     ExecutorStart_hook = prev_ExecutorStart;
-    ExecutorFinish_hook = prev_ExecutorFinish;
+    ExecutorEnd_hook = prev_ExecutorEnd;
 }
 
 /*
@@ -147,18 +147,18 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 }
 
 /* 
-    Хук ExecutorFinish. Убираем из стека последний запрос 
+    Хук ExecutorEnd. Убираем из стека последний запрос 
 */
 static void
-pg_query_stack_ExecutorFinish(QueryDesc *queryDesc)
+pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
 {
     PG_TRY();
     {
         // Сначала вызываем предыдущие хуки 
-        if (prev_ExecutorFinish)
-            prev_ExecutorFinish(queryDesc);
+        if (prev_ExecutorEnd)
+            prev_ExecutorEnd(queryDesc);
         else
-            standard_ExecutorFinish(queryDesc);
+            standard_ExecutorEnd(queryDesc);
     }
     PG_CATCH();
     {
