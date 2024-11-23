@@ -70,18 +70,22 @@ pg_stack_free(void)
 {
     if (Query_Stack != NIL)
     {
+        MemoryContext oldcontext;
+
+        // Переключаемся на TopMemoryContext
+        oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
         QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
 
         if (entry->query_text)
-            // Освобождаем память выделенную под строку
             pfree(entry->query_text);
-        // Освобождаем память выделенную под структуру
         pfree(entry);
-        
-        // Удаляем текущий Query_Desc из списка
+
+        // Возвращаемся к предыдущему контексту
+        MemoryContextSwitchTo(oldcontext);
+
         Query_Stack = list_delete_first(Query_Stack);
-    }
-}
+    }}
 
 /* Загрузка расширения в память */
 void
@@ -115,6 +119,11 @@ _PG_fini(void)
 static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+    MemoryContext oldcontext;
+
+    // Переключаемся на TopMemoryContext
+    oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
     // Создаём новый элемент стека
     QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
 
@@ -127,6 +136,9 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     // Добавляем запись в наш стек
     Query_Stack = lcons(entry, Query_Stack);
     
+    // Возвращаемся к предыдущему контексту
+    MemoryContextSwitchTo(oldcontext);
+
     PG_TRY();
     {
         // Далее вызываем следующий хук или стандартную функцию
