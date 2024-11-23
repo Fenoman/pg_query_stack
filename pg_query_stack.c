@@ -7,7 +7,6 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "executor/executor.h"
-#include "executor/spi.h"  /* Для использования SPI и глобального стека QueryDescStack */
 #include "nodes/execnodes.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -22,11 +21,11 @@
 PG_MODULE_MAGIC;
 
 /* 
-    Объявление переменной QueryDescStack где будет накапливать стек запросов.
-    Стек QueryDescStack обновляется в хуках ExecutorStart и ExecutorFinish. Он должен корректно восстанавливаться независимо от завершения транзакции.
+    Объявление переменной Query_Stack где будет накапливать стек запросов.
+    Стек Query_Stack обновляется в хуках ExecutorStart и ExecutorFinish. Он должен корректно восстанавливаться независимо от завершения транзакции.
     При ошибках внутри запросов мы используем блоки PG_TRY и PG_CATCH, чтобы гарантировать, что стек будет корректно обновлён даже при возникновении исключений.
 */
-static List *QueryDescStack = NIL;
+static List *Query_Stack = NIL;
 
 // Прототипы функций инициализации расширения и выгрузки
 void _PG_init(void);
@@ -43,7 +42,7 @@ Datum pg_query_stack(PG_FUNCTION_ARGS);
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 
-// Собственная реализация функции переворота списка, так как list_reverse не доступна для модулей
+// Собственная реализация функции переворота списка, так как внутренняя list_reverse не доступна для модулей
 static List *
 pg_list_reverse_copy(List *list)
 {
@@ -58,7 +57,7 @@ pg_list_reverse_copy(List *list)
     return reversed;
 }
 
-/* Инициализация расширения */
+/* Загрузка расширения в память */
 void
 _PG_init(void)
 {
@@ -69,7 +68,7 @@ _PG_init(void)
     ExecutorFinish_hook = pg_query_stack_ExecutorFinish;
 }
 
-/* Финализация расширения */
+/* Выгрузка расширения из памяти */
 void
 _PG_fini(void)
 {
@@ -78,7 +77,7 @@ _PG_fini(void)
 }
 
 /*
-Выполняем перехват запроса нашим хуком и записываем его в стек (список QueryDescStack). 
+Выполняем перехват запроса нашим хуком и записываем его в стек (список Query_Stack). 
 Почему именно ExecutorStart:
     ExecutorStart: Вызывается в самом начале выполнения плана запроса, перед тем как будут обработаны какие-либо данные. 
                    Он позволяет выполнить инициализацию или модификации перед началом фактического исполнения запроса, или запись в стек в нашем случае
@@ -90,14 +89,8 @@ _PG_fini(void)
 static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-    // Включаем инструментарий для сбора информации о запросах
-    if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
-    {
-        queryDesc->instrument_options |= INSTRUMENT_ROWS;
-    }
-
     // Добавляем текущий QueryDesc в стек
-    QueryDescStack = lcons(queryDesc, QueryDescStack);
+    Query_Stack = lcons(queryDesc, Query_Stack);
 
     PG_TRY();
     {
@@ -110,7 +103,7 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     PG_CATCH();
     {
         // Убираем текущий QueryDesc из стека при ошибке
-        QueryDescStack = list_delete_first(QueryDescStack);
+        Query_Stack = list_delete_first(Query_Stack);
         // Заново прокидываем ошибку
         PG_RE_THROW();
     }
@@ -134,14 +127,14 @@ pg_query_stack_ExecutorFinish(QueryDesc *queryDesc)
     PG_CATCH();
     {
         // Убираем текущий QueryDesc из стека при ошибке
-        QueryDescStack = list_delete_first(QueryDescStack);
+        Query_Stack = list_delete_first(Query_Stack);
         // Заново прокидываем ошибку
         PG_RE_THROW();
     }
     PG_END_TRY();
 
     // Убираем текущий QueryDesc из стека
-    QueryDescStack = list_delete_first(QueryDescStack);
+    Query_Stack = list_delete_first(Query_Stack);
 }
 
 /*
@@ -189,9 +182,9 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         /* 
             Копируем текущий стек запросов, чтобы он точно не изменился во время исполнения функции 
         */
-        if (QueryDescStack != NIL)
+        if (Query_Stack != NIL)
         {
-            stack_copy = list_copy(QueryDescStack);
+            stack_copy = list_copy(Query_Stack);
 
             // Пропускаем указанное количество элементов
             while (depth < skip_count && stack_copy != NIL)
