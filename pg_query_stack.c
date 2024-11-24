@@ -11,6 +11,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
+#include "access/xact.h"
 
 /*
 Ключевое слово PG_MODULE_MAGIC используется для вставки специального "магического" блока информации в скомпилированную библиотеку расширения. 
@@ -30,7 +31,7 @@ static List *Query_Stack = NIL;
 // Структура для хранения копии запроса
 typedef struct QueryStackEntry
 {
-    const char *query_text;
+    char *query_text;
 } QueryStackEntry;
 
 
@@ -41,6 +42,7 @@ void _PG_fini(void);
 // Прототипы хуков
 static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
+static void pg_query_stack_xact_callback(XactEvent event, void *arg);
 
 // Прототип нашей функции получения стека запросов
 Datum pg_query_stack(PG_FUNCTION_ARGS);
@@ -89,6 +91,9 @@ _PG_init(void)
 
     prev_ExecutorEnd = ExecutorEnd_hook;
     ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
+    
+    // Регистрируем callback транзакции
+    RegisterXactCallback(pg_query_stack_xact_callback, NULL);
 }
 
 /* Выгрузка расширения из памяти */
@@ -97,6 +102,37 @@ _PG_fini(void)
 {
     ExecutorStart_hook = prev_ExecutorStart;
     ExecutorEnd_hook = prev_ExecutorEnd;
+    
+    // Снимаем регистрацию callback транзакции
+    UnregisterXactCallback(pg_query_stack_xact_callback, NULL);
+}
+
+/* 
+    Функция обратного вызова транзакции
+    Зачем она нам нужен? 
+    Дело в том, что есть случаи когда у нас НЕ вызывается End хук и стек остается не очищенным.
+    Это такие случаи, когда например во вложенном вызове происходит ошибка на этапе разбора плана (не нашлась таблица, функция, колонка).
+    В этом случае происходит мгновенный выход из транзакции и не вызываются End хуки головного запроса и так далее по цепочке выше.
+    В этих случаях мы перехватываем callback транзакции и очищаем ВЕСЬ стек вручную. 
+*/
+static void
+pg_query_stack_xact_callback(XactEvent event, void *arg)
+{
+    /* Обрабатываем оба случая: успешное завершение и откат транзакции */
+    if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
+    {
+        /* Очищаем Query_Stack полностью */
+        while (Query_Stack != NIL)
+        {
+            QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
+
+            if (entry->query_text)
+                pfree(entry->query_text);
+            pfree(entry);
+
+            Query_Stack = list_delete_first(Query_Stack);
+        }
+    }
 }
 
 /*
@@ -117,7 +153,7 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     /*
         CurTransactionContext
         * Живет в течение одной открытой транзакции.
-        * Уничтожается при завершении транзакции (COMMIT или ROLLBACK).
+        * Уничтожается при завершении транзакции (COMMIT или ROLLBACK), но не в случае когда ошибка возникает на этапе разбора плана!!!
         * Уменьшение использования TopMemoryContext, что снижает риск утечек памяти при ошибках. 
         * Создание и очистка CurTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
     */
