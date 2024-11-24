@@ -23,7 +23,7 @@ PG_MODULE_MAGIC;
 
 /* 
     Объявление переменной Query_Stack где будет накапливать стек запросов.
-    Стек Query_Stack обновляется в хуках ExecutorStart и ExecutorFinish. Он должен корректно восстанавливаться независимо от завершения транзакции.
+    Стек Query_Stack обновляется в хуках ExecutorStart и ExecutorEnd. Он должен корректно восстанавливаться независимо от завершения транзакции.
     При ошибках внутри запросов мы используем блоки PG_TRY и PG_CATCH, чтобы гарантировать, что стек будет корректно обновлён даже при возникновении исключений.
 */
 static List *Query_Stack = NIL;
@@ -39,7 +39,7 @@ typedef struct QueryStackEntry
 void _PG_init(void);
 void _PG_fini(void);
 
-// Прототипы хуков
+// Прототипы хуков и обратных вызовов
 static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 static void pg_query_stack_xact_callback(XactEvent event, void *arg);
@@ -66,7 +66,7 @@ pg_list_reverse_copy(List *list)
     return reversed;
 }
 
-// Освобождение памяти
+// Удаление последней добавленной записи в стек освобождение памяти
 static void
 pg_stack_free(void)
 {
@@ -86,9 +86,9 @@ pg_stack_free(void)
 void
 _PG_init(void)
 {
+    // Регистрируем хуки (сохраняя прошлые)
     prev_ExecutorStart = ExecutorStart_hook;
     ExecutorStart_hook = pg_query_stack_ExecutorStart;
-
     prev_ExecutorEnd = ExecutorEnd_hook;
     ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
     
@@ -100,6 +100,7 @@ _PG_init(void)
 void
 _PG_fini(void)
 {
+    // Восстанавливаем прошлые хуки
     ExecutorStart_hook = prev_ExecutorStart;
     ExecutorEnd_hook = prev_ExecutorEnd;
     
@@ -206,11 +207,11 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
 {
     PG_TRY();
     {
-    // Сначала вызываем предыдущие хуки 
-    if (prev_ExecutorEnd)
-        prev_ExecutorEnd(queryDesc);
-    else
-        standard_ExecutorEnd(queryDesc);
+        // Сначала вызываем предыдущие хуки 
+        if (prev_ExecutorEnd)
+            prev_ExecutorEnd(queryDesc);
+        else
+            standard_ExecutorEnd(queryDesc);
     }
     PG_CATCH();
     {
