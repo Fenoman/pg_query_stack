@@ -152,15 +152,15 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     MemoryContext oldcontext;
     
     /*
-        CurTransactionContext
-        * Живет в течение одной открытой транзакции.
+        TopTransactionContext
+        * Живет в течение одной открытой верхнеуровневой транзакции.
         * Уничтожается при завершении транзакции (COMMIT или ROLLBACK), но не в случае когда ошибка возникает на этапе разбора плана!!!
         * Уменьшение использования TopMemoryContext, что снижает риск утечек памяти при ошибках. 
-        * Создание и очистка CurTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
+        * Создание и очистка TopTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
     */
-    if (CurTransactionContext != NULL)
+    if (TopTransactionContext != NULL)
         // Если контекст транзакции существует то переключаемся на него
-        oldcontext = MemoryContextSwitchTo(CurTransactionContext);
+        oldcontext = MemoryContextSwitchTo(TopTransactionContext);
     else    
         // Иначе используем контекст сессии (подстраховка)
         oldcontext = MemoryContextSwitchTo(TopMemoryContext);
