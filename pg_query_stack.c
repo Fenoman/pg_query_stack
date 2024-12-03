@@ -44,6 +44,10 @@ static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 static void pg_query_stack_xact_callback(XactEvent event, void *arg);
 
+// Собственный контекст памяти
+static MemoryContext QueryStackContext = NULL;
+
+
 // Прототип нашей функции получения стека запросов
 Datum pg_query_stack(PG_FUNCTION_ARGS);
 
