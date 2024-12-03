@@ -74,9 +74,12 @@ pg_stack_free(void)
     {
         QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
 
-        if (entry->query_text)
-            pfree(entry->query_text);
-        pfree(entry);
+        if (entry != NULL)
+        {
+            if (entry->query_text)
+                pfree(entry->query_text);
+            pfree(entry);
+        }
 
         Query_Stack = list_delete_first(Query_Stack);
     }
@@ -86,14 +89,16 @@ pg_stack_free(void)
 void
 _PG_init(void)
 {
+    // Создаем свой контекст памяти
+    QueryStackContext = AllocSetContextCreate(TopTransactionContext,
+                                              "QueryStackContext",
+                                              ALLOCSET_DEFAULT_SIZES);
+
     // Регистрируем хуки (сохраняя прошлые)
     prev_ExecutorStart = ExecutorStart_hook;
     ExecutorStart_hook = pg_query_stack_ExecutorStart;
     prev_ExecutorEnd = ExecutorEnd_hook;
     ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
-    
-    // Регистрируем callback транзакции
-    RegisterXactCallback(pg_query_stack_xact_callback, NULL);
 }
 
 /* Выгрузка расширения из памяти */
@@ -103,37 +108,6 @@ _PG_fini(void)
     // Восстанавливаем прошлые хуки
     ExecutorStart_hook = prev_ExecutorStart;
     ExecutorEnd_hook = prev_ExecutorEnd;
-    
-    // Снимаем регистрацию callback транзакции
-    UnregisterXactCallback(pg_query_stack_xact_callback, NULL);
-}
-
-/* 
-    Функция обратного вызова транзакции
-    Зачем он нам нужен? 
-    Дело в том, что есть случаи когда у нас НЕ вызывается End хук и стек остается не очищенным.
-    Это такие случаи, когда например во вложенном вызове происходит ошибка на этапе разбора плана (не нашлась таблица, функция, колонка).
-    В этом случае происходит мгновенный выход из транзакции и не вызываются End хуки головного запроса и так далее по цепочке выше.
-    В этих случаях мы перехватываем callback транзакции и очищаем ВЕСЬ стек вручную. 
-*/
-static void
-pg_query_stack_xact_callback(XactEvent event, void *arg)
-{
-    /* Обрабатываем оба случая: успешное завершение и откат транзакции */
-    if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
-    {
-        /* Очищаем Query_Stack полностью */
-        while (Query_Stack != NIL)
-        {
-            QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
-
-            if (entry->query_text)
-                pfree(entry->query_text);
-            pfree(entry);
-
-            Query_Stack = list_delete_first(Query_Stack);
-        }
-    }
 }
 
 /*
@@ -151,19 +125,8 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
     MemoryContext oldcontext;
     
-    /*
-        TopTransactionContext
-        * Живет в течение одной открытой верхнеуровневой транзакции.
-        * Уничтожается при завершении транзакции (COMMIT или ROLLBACK), но не в случае когда ошибка возникает на этапе разбора плана!!!
-        * Уменьшение использования TopMemoryContext, что снижает риск утечек памяти при ошибках. 
-        * Создание и очистка TopTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
-    */
-    if (TopTransactionContext != NULL)
-        // Если контекст транзакции существует то переключаемся на него
-        oldcontext = MemoryContextSwitchTo(TopTransactionContext);
-    else    
-        // Иначе используем контекст сессии (подстраховка)
-        oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+    // Переключаемся на собственный контекст
+    oldcontext = MemoryContextSwitchTo(QueryStackContext);
 
     // Создаём новый элемент стека
     QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
@@ -362,6 +325,12 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
     
     // Получаем наш скопированный стек из контекста
     List       *stack = (List *) funcctx->user_fctx;
+    
+    if (stack == NIL)
+    {
+        // Сразу выходим из функции если вдруг стек пустой
+        SRF_RETURN_DONE(funcctx);
+    }
     
     /*
         Получаем текущий номер вызова (call_cntr)
