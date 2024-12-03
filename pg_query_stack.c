@@ -44,12 +44,16 @@ static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 static void pg_query_stack_xact_callback(XactEvent event, void *arg);
 
+// Порождаемый контекст памяти от TopTransactionContext
+static MemoryContext QueryStackContext = NULL;
+
 // Прототип нашей функции получения стека запросов
 Datum pg_query_stack(PG_FUNCTION_ARGS);
 
 // Сюда сохраняем предыдущие хуки для их восстановления при выгрузке расширения
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+
 
 // Собственная реализация функции переворота списка, так как внутренняя list_reverse не доступна для модулей
 static List *
@@ -66,26 +70,22 @@ pg_list_reverse_copy(List *list)
     return reversed;
 }
 
+
 // Удаление последней добавленной записи в стек освобождение памяти
 static void
 pg_stack_free(void)
 {
     if (Query_Stack != NIL)
     {
-        QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
-
-        if (entry != NULL)
-        {
-            if (entry->query_text)
-                pfree(entry->query_text);
-            pfree(entry);
-        }
-
+        // Удаляем последний добавленный элемент
         Query_Stack = list_delete_first(Query_Stack);
+        
+        // Освобождать память не нужно, все за нас сделает Postgres при очистке QueryStackContext
     }
 }
 
-/* Загрузка расширения в память */
+
+// Загрузка расширения в память
 void
 _PG_init(void)
 {
@@ -99,7 +99,8 @@ _PG_init(void)
     RegisterXactCallback(pg_query_stack_xact_callback, NULL);
 }
 
-/* Выгрузка расширения из памяти */
+
+// Выгрузка расширения из памяти
 void
 _PG_fini(void)
 {
@@ -124,11 +125,13 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
 {
     if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
     {
-        // Очищаем Query_Stack полностью
-        while (Query_Stack != NIL)
+        if (QueryStackContext != NULL)
         {
-            pg_stack_free();
+            MemoryContextDelete(QueryStackContext);
+            QueryStackContext = NULL;
         }
+
+        Query_Stack = NIL;
     }
 }
 
@@ -147,30 +150,37 @@ static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
     MemoryContext oldcontext;
-    
-    /*
-        TopTransactionContext
-        * Живет в течение одной открытой верхнеуровневой транзакции.
-        * Уничтожается при завершении транзакции (COMMIT или ROLLBACK), но не в случае когда ошибка возникает на этапе разбора плана!!!
-        * Уменьшение использования TopMemoryContext, что снижает риск утечек памяти при ошибках. 
-        * Создание и очистка TopTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
-    */
-    if (TopTransactionContext != NULL)
+
+    // Если по какой-то причине нам не доступен контекст транзакции - просто выходим
+    if (TopTransactionContext == NULL)
     {
-        // Если контекст транзакции существует то переключаемся на него
-        oldcontext = MemoryContextSwitchTo(TopTransactionContext);
-    }
-    else    
-    {
-        // Далее вызываем следующий хук или стандартную функцию
         if (prev_ExecutorStart)
             prev_ExecutorStart(queryDesc, eflags);
         else
             standard_ExecutorStart(queryDesc, eflags);
-        
+            
         return;
     }
-
+    
+    // Порождаем свой контекст от TopTransactionContext
+    if (QueryStackContext == NULL)
+    {
+        /*
+            TopTransactionContext
+            * Живет в течение одной открытой верхнеуровневой транзакции.
+            * Уничтожается при завершении транзакции (COMMIT или ROLLBACK)
+            * Создание и очистка TopTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
+            
+            Создание QueryStackContext от него обеспечивает дополнительный уровень изоляции памяти
+        */
+        QueryStackContext = AllocSetContextCreate(TopTransactionContext,
+                                                  "QueryStackContext",
+                                                  ALLOCSET_DEFAULT_SIZES);
+    }
+    
+    // Перелючаем на собственный контекст
+    oldcontext = MemoryContextSwitchTo(QueryStackContext);
+    
     // Создаём новый элемент стека
     QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
 
