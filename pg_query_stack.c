@@ -28,6 +28,13 @@ PG_MODULE_MAGIC;
 */
 static List *Query_Stack = NIL;
 
+// Максимальная глубина стека
+#define MAX_QUERY_STACK_DEPTH 1000
+
+// фактическая глубина стека – чтобы не пересчитывать list_length() каждый раз
+static int Query_Stack_Depth = 0;
+
+
 // Структура для хранения копии запроса
 typedef struct QueryStackEntry
 {
@@ -77,10 +84,21 @@ pg_stack_free(void)
 {
     if (Query_Stack != NIL)
     {
-        // Удаляем последний добавленный элемент
+        QueryStackEntry *entry = (QueryStackEntry *) linitial(Query_Stack);
+		
+		// освободим само содержимое
+        if (entry)
+        {
+            pfree(entry->query_text);
+            pfree(entry);
+        }
+		
+		// теперь удаляем ListCell
         Query_Stack = list_delete_first(Query_Stack);
         
-        // Освобождать память не нужно, все за нас сделает Postgres при очистке QueryStackContext
+        // Уменьшаем счетчик
+        if (Query_Stack_Depth > 0)
+            Query_Stack_Depth--;
     }
 }
 
@@ -132,6 +150,7 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
         }
 
         Query_Stack = NIL;
+		Query_Stack_Depth = 0;
     }
 }
 
@@ -149,7 +168,8 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
 static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-    MemoryContext oldcontext;
+    MemoryContext   oldcontext;
+    volatile bool   stack_pushed = false;   /* обязательно volatile для PG_TRY */
 
     // Если по какой-то причине нам не доступен контекст транзакции - просто выходим
     if (TopTransactionContext == NULL)
@@ -158,14 +178,13 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
             prev_ExecutorStart(queryDesc, eflags);
         else
             standard_ExecutorStart(queryDesc, eflags);
-            
         return;
     }
-    
+
     // Порождаем свой контекст от TopTransactionContext
     if (QueryStackContext == NULL)
     {
-        /*
+    	/*
             TopTransactionContext
             * Живет в течение одной открытой верхнеуровневой транзакции.
             * Уничтожается при завершении транзакции (COMMIT или ROLLBACK)
@@ -177,23 +196,43 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
                                                   "QueryStackContext",
                                                   ALLOCSET_DEFAULT_SIZES);
     }
-    
+
+    // LIM: если стек уже достиг лимита, удаляем самый глубокий элемент
+    if (Query_Stack_Depth >= MAX_QUERY_STACK_DEPTH)
+    {
+        // llast() – последний элемент списка
+        QueryStackEntry *tail = (QueryStackEntry *) llast(Query_Stack);
+        if (tail)
+        {
+            pfree(tail->query_text);
+            pfree(tail);
+        }
+        Query_Stack = list_delete_last(Query_Stack);
+        
+        // компенсируем последующий ++
+        Query_Stack_Depth--;        
+    }
+	
     // Перелючаем на собственный контекст
     oldcontext = MemoryContextSwitchTo(QueryStackContext);
-    
-    // Создаём новый элемент стека
+	
+	// Создаём новый элемент стека
     QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
-
-    // Копируем sourceText
-    if (queryDesc->sourceText)
-        entry->query_text = pstrdup(queryDesc->sourceText);
-    else
-        entry->query_text = pstrdup("<unnamed query>");
-
-    // Добавляем запись в наш стек
-    Query_Stack = lcons(entry, Query_Stack);
     
-    // Возвращаемся к предыдущему контексту
+    // Копируем sourceText
+    entry->query_text = queryDesc->sourceText ?
+                        pstrdup(queryDesc->sourceText) :
+                        pstrdup("<unnamed query>");
+	
+	// Добавляем запись в наш стек
+    Query_Stack = lcons(entry, Query_Stack);
+    Query_Stack_Depth++;
+    
+    
+    // отметим факт добавления
+    stack_pushed = true;                    
+
+	// Возвращаемся к предыдущему контексту
     MemoryContextSwitchTo(oldcontext);
 
     PG_TRY();
@@ -206,10 +245,11 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     }
     PG_CATCH();
     {
-        // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
-        pg_stack_free();
-        
-        // Заново прокидываем ошибку
+        // При любой ошибке убираем то, что успели положить
+        if (stack_pushed)
+            pg_stack_free();
+
+		// Заново прокидываем ошибку
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -239,7 +279,7 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
     }
     PG_END_TRY();
         
-    // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
+    // Убираем текущий Query_Desc из списка
     pg_stack_free();
 }
 
@@ -412,7 +452,7 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         QueryStackEntry *entry = (QueryStackEntry *) list_nth(stack, call_cntr);
         
         // Уровень вложенности запроса
-        int frame_number = call_cntr;
+        int32 frame_number = call_cntr;
         // Получаем текст запроса
         const char *query_text = entry->query_text;
 
