@@ -1,5 +1,5 @@
 # pg_query_stack extension
 comment = 'tool to get query stack'
-default_version = '1.0.4'
+default_version = '1.0.5'
 module_pathname = '$libdir/pg_query_stack'
 relocatable = true

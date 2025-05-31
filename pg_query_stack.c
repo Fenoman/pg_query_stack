@@ -11,6 +11,7 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
+#include "access/parallel.h" 
 #include "access/xact.h"
 
 /*
@@ -89,7 +90,8 @@ pg_stack_free(void)
 		// освободим само содержимое
         if (entry)
         {
-            pfree(entry->query_text);
+        	if (entry->query_text)
+                pfree(entry->query_text);
             pfree(entry);
         }
 		
@@ -143,14 +145,14 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
 {
     if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
     {
+        Query_Stack = NIL;
+		Query_Stack_Depth = 0;
+        
         if (QueryStackContext != NULL)
         {
             MemoryContextDelete(QueryStackContext);
             QueryStackContext = NULL;
         }
-
-        Query_Stack = NIL;
-		Query_Stack_Depth = 0;
     }
 }
 
@@ -168,9 +170,21 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
 static void
 pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-    MemoryContext   oldcontext;
+	MemoryContext   oldcontext;
     volatile bool   stack_pushed = false;   /* обязательно volatile для PG_TRY */
+    QueryStackEntry *entry;
+    QueryStackEntry *tail;
 
+    // Пропускаем обработку для параллельных workers
+    if (IsParallelWorker())
+    {
+        if (prev_ExecutorStart)
+            prev_ExecutorStart(queryDesc, eflags);
+        else
+            standard_ExecutorStart(queryDesc, eflags);
+        return;
+    }
+    
     // Если по какой-то причине нам не доступен контекст транзакции - просто выходим
     if (TopTransactionContext == NULL)
     {
@@ -201,7 +215,7 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     if (Query_Stack_Depth >= MAX_QUERY_STACK_DEPTH)
     {
         // llast() – последний элемент списка
-        QueryStackEntry *tail = (QueryStackEntry *) llast(Query_Stack);
+        tail = (QueryStackEntry *) llast(Query_Stack);
         if (tail)
         {
             pfree(tail->query_text);
@@ -217,7 +231,7 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
     oldcontext = MemoryContextSwitchTo(QueryStackContext);
 	
 	// Создаём новый элемент стека
-    QueryStackEntry *entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
+    entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
     
     // Копируем sourceText
     entry->query_text = queryDesc->sourceText ?
@@ -226,11 +240,9 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	
 	// Добавляем запись в наш стек
     Query_Stack = lcons(entry, Query_Stack);
-    Query_Stack_Depth++;
-    
-    
     // отметим факт добавления
-    stack_pushed = true;                    
+    stack_pushed = true;     
+    Query_Stack_Depth++;
 
 	// Возвращаемся к предыдущему контексту
     MemoryContextSwitchTo(oldcontext);
@@ -296,8 +308,12 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
 {
     // Контекст вызова функции, используется для хранения информации между вызовами
     FuncCallContext *funcctx;
+    int              skip_count;
+    List            *stack;
+    int              call_cntr;
+    
     // Получаем параметр _skip_count: это количество запросов в стеке, которые нам необходимо пропустить при возвращении результата
-    int              skip_count = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0);
+    skip_count = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0);
 
     if (skip_count < 0)
         skip_count = 0;
@@ -311,6 +327,8 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         MemoryContext     oldcontext;
         List             *stack_copy;
         int               depth = 0;
+        ListCell         *lc;           // Объявляем здесь!
+    	TupleDesc         tupdesc;      // И это тоже!
         
         // Инициализируем FuncCallContext для хранения состояния между вызовами
         funcctx = SRF_FIRSTCALL_INIT();
@@ -331,7 +349,6 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         if (Query_Stack != NIL)
         {
             stack_copy = NIL;
-            ListCell   *lc;
             
             foreach(lc, Query_Stack)
             {
@@ -379,7 +396,7 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
                 Создаем описание кортежа при первом вызове
             */
             // Описание кортежа (структура возвращаемых данных) из 2х колонок
-            TupleDesc tupdesc = CreateTemplateTupleDesc(2);
+            tupdesc = CreateTemplateTupleDesc(2);
             
             /*
                 TupleDescInitEntry — инициализируем каждое поле:
@@ -417,7 +434,7 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
     funcctx = SRF_PERCALL_SETUP();
     
     // Получаем наш скопированный стек из контекста
-    List       *stack = (List *) funcctx->user_fctx;
+    stack = (List *) funcctx->user_fctx;
     
     if (stack == NIL)
     {
@@ -429,7 +446,7 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         Получаем текущий номер вызова (call_cntr)
         ? call_cntr автоматически увеличивается PostgreSQL при каждом вызове функции в SRF. Начинается с 0 (как и массивы/списки в С)
     */
-    int         call_cntr = funcctx->call_cntr;
+    call_cntr = funcctx->call_cntr;
 
     // Пока текущий номер вызова не достиг крайнего - возвращаем следующую строчку
     if (call_cntr < funcctx->max_calls)
