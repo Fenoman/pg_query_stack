@@ -1,0 +1,27 @@
+-- Тест 005: Вложенные вызовы с пропуском по умолчанию
+CREATE OR REPLACE FUNCTION test_nested_stack ()
+    RETURNS table
+            (
+                frame_number int,
+                query_text   text
+            )
+AS
+$$
+BEGIN
+    RETURN QUERY SELECT
+                     *
+                 FROM pg_query_stack()
+                 UNION ALL
+                 SELECT
+                     *
+                 FROM pg_query_stack(0);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Вызываем функцию с вложенным стеком
+SELECT
+    *
+FROM test_nested_stack();
+
+-- Удаляем тестовую функцию
+DROP FUNCTION test_nested_stack();

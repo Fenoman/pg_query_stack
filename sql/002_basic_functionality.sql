@@ -1,0 +1,8 @@
+-- Тест 002: Базовая функциональность
+-- Проверим, что функция возвращает себя в стеке при вызове с параметром 0
+SELECT frame_number, 
+       CASE 
+           WHEN query_text LIKE '%pg_query_stack(0)%' THEN 'Contains pg_query_stack(0) call'
+           ELSE 'Unexpected query: ' || query_text 
+       END as test_result
+FROM pg_query_stack(0);

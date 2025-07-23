@@ -30,7 +30,10 @@ PG_MODULE_MAGIC;
 static List *Query_Stack = NIL;
 
 // Максимальная глубина стека
-#define MAX_QUERY_STACK_DEPTH 1000
+#define MAX_QUERY_STACK_DEPTH 100
+
+// Максимальная длина текста запроса (для защиты от переполнения памяти)
+#define MAX_QUERY_TEXT_LENGTH 524288  /* 512Kb */
 
 // фактическая глубина стека – чтобы не пересчитывать list_length() каждый раз
 static int Query_Stack_Depth = 0;
@@ -52,9 +55,6 @@ static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 static void pg_query_stack_xact_callback(XactEvent event, void *arg);
 
-// Порождаемый контекст памяти от TopTransactionContext
-static MemoryContext QueryStackContext = NULL;
-
 // Прототип нашей функции получения стека запросов
 Datum pg_query_stack(PG_FUNCTION_ARGS);
 
@@ -70,12 +70,39 @@ pg_list_reverse_copy(List *list)
     List       *reversed = NIL;
     ListCell   *cell;
 
+    /* Защита от NULL */
+    if (list == NIL)
+        return NIL;
+
     foreach(cell, list)
     {
         reversed = lcons(lfirst(cell), reversed);
     }
 
     return reversed;
+}
+
+// Вспомогательная функция для полной очистки списка с освобождением памяти элементов
+static void
+pg_stack_list_free_deep(List *list)
+{
+    ListCell   *cell;
+    
+    if (list == NIL)
+        return;
+        
+    foreach(cell, list)
+    {
+        QueryStackEntry *entry = (QueryStackEntry *) lfirst(cell);
+        if (entry)
+        {
+            if (entry->query_text)
+                pfree(entry->query_text);
+            pfree(entry);
+        }
+    }
+    
+    list_free(list);
 }
 
 
@@ -115,7 +142,7 @@ _PG_init(void)
     prev_ExecutorEnd = ExecutorEnd_hook;
     ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
     
-    // Регистрируем callback транзакции
+    // Регистрация callback транзакции
     RegisterXactCallback(pg_query_stack_xact_callback, NULL);
 }
 
@@ -130,6 +157,14 @@ _PG_fini(void)
     
     // Снимаем регистрацию callback транзакции
     UnregisterXactCallback(pg_query_stack_xact_callback, NULL);
+    
+    // Явная очистка стека на случай выгрузки посреди транзакции (для предотвращения временного удержания до выхода процесса)
+    if (Query_Stack != NIL) 
+    {
+        pg_stack_list_free_deep(Query_Stack);
+        Query_Stack = NIL;
+        Query_Stack_Depth = 0;
+    }
 }
 
 /* 
@@ -145,14 +180,13 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
 {
     if (event == XACT_EVENT_ABORT || event == XACT_EVENT_COMMIT)
     {
-        Query_Stack = NIL;
-		Query_Stack_Depth = 0;
-        
-        if (QueryStackContext != NULL)
+        /* Очищаем список с освобождением памяти всех элементов */
+        if (Query_Stack != NIL)
         {
-            MemoryContextDelete(QueryStackContext);
-            QueryStackContext = NULL;
+            pg_stack_list_free_deep(Query_Stack);
+            Query_Stack = NIL;
         }
+        Query_Stack_Depth = 0;
     }
 }
 
@@ -195,22 +229,6 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
         return;
     }
 
-    // Порождаем свой контекст от TopTransactionContext
-    if (QueryStackContext == NULL)
-    {
-    	/*
-            TopTransactionContext
-            * Живет в течение одной открытой верхнеуровневой транзакции.
-            * Уничтожается при завершении транзакции (COMMIT или ROLLBACK)
-            * Создание и очистка TopTransactionContext имеют минимальный оверхед, который незначителен по сравнению с общей стоимостью обработки транзакции.
-            
-            Создание QueryStackContext от него обеспечивает дополнительный уровень изоляции памяти
-        */
-        QueryStackContext = AllocSetContextCreate(TopTransactionContext,
-                                                  "QueryStackContext",
-                                                  ALLOCSET_DEFAULT_SIZES);
-    }
-
     // LIM: если стек уже достиг лимита, удаляем самый глубокий элемент
     if (Query_Stack_Depth >= MAX_QUERY_STACK_DEPTH)
     {
@@ -227,16 +245,47 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
         Query_Stack_Depth--;        
     }
 	
-    // Перелючаем на собственный контекст
-    oldcontext = MemoryContextSwitchTo(QueryStackContext);
+    // Переключаем на TopTransactionContext напрямую
+    oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 	
-	// Создаём новый элемент стека
-    entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
-    
-    // Копируем sourceText
-    entry->query_text = queryDesc->sourceText ?
-                        pstrdup(queryDesc->sourceText) :
-                        pstrdup("<unnamed query>");
+	// Создаём новый элемент стека с explicit OOM handling
+	PG_TRY(); 
+	{
+    	entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
+	} 
+	PG_CATCH(); 
+	{
+		// Пишет в лог, что памяти нам не хватило...
+		elog(WARNING, "OOM in pg_query_stack_ExecutorStart: skipping stack push");
+		
+		// Переключаемся на прошлый контекст
+		MemoryContextSwitchTo(oldcontext);  
+		
+		// Заново прокидываем ошибку
+		PG_RE_THROW();
+	} 
+	PG_END_TRY();	
+	
+    // Копируем sourceText с проверкой длины и truncation indicator
+    if (queryDesc->sourceText)
+    {
+        size_t len = strlen(queryDesc->sourceText);
+        if (len > MAX_QUERY_TEXT_LENGTH) 
+        {
+            /* Обрезаем слишком длинные запросы и добавляем индикатор */
+            entry->query_text = (char *) palloc(MAX_QUERY_TEXT_LENGTH + 14);  // + strlen("... truncated") + 1
+			memcpy(entry->query_text, queryDesc->sourceText, MAX_QUERY_TEXT_LENGTH);
+			strcpy(entry->query_text + MAX_QUERY_TEXT_LENGTH, "... truncated");
+		}
+        else
+        {
+            entry->query_text = pstrdup(queryDesc->sourceText);
+        }
+    }
+    else
+    {
+        entry->query_text = pstrdup("<unnamed query>");
+    }
 	
 	// Добавляем запись в наш стек
     Query_Stack = lcons(entry, Query_Stack);
@@ -273,6 +322,18 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
 {
+    volatile bool cleaned = false;
+    
+    /* Пропускаем обработку для параллельных workers */
+    if (IsParallelWorker())
+    {
+        if (prev_ExecutorEnd)
+            prev_ExecutorEnd(queryDesc);
+        else
+            standard_ExecutorEnd(queryDesc);
+        return;
+    }
+    
     PG_TRY();
     {
         // Сначала вызываем предыдущие хуки 
@@ -285,14 +346,16 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
     {
         // Убираем текущий Query_Desc из списка при ошибке и освобождаем память
         pg_stack_free();
+        cleaned = true;
     
         // Заново прокидываем ошибку
         PG_RE_THROW();
     }
     PG_END_TRY();
         
-    // Убираем текущий Query_Desc из списка
-    pg_stack_free();
+    // Убираем текущий Query_Desc из списка только если не очистили в CATCH
+    if (!cleaned)
+        pg_stack_free();
 }
 
 /*
@@ -315,8 +378,11 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
     // Получаем параметр _skip_count: это количество запросов в стеке, которые нам необходимо пропустить при возвращении результата
     skip_count = PG_ARGISNULL(0) ? 0 : PG_GETARG_INT32(0);
 
+    /* Валидация параметров */
     if (skip_count < 0)
         skip_count = 0;
+    else if (skip_count > MAX_QUERY_STACK_DEPTH)
+        skip_count = MAX_QUERY_STACK_DEPTH;
 
     /* 
         Проверяем, является ли текущий вызов первым в серии вызовов SRF (set-returning function, SRF). 
@@ -326,7 +392,6 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
     {
         MemoryContext     oldcontext;
         List             *stack_copy;
-        int               depth = 0;
         ListCell         *lc;           // Объявляем здесь!
     	TupleDesc         tupdesc;      // И это тоже!
         
@@ -344,16 +409,31 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
         /* 
-            Копируем текущий стек запросов, чтобы он точно не изменился во время исполнения функции 
+            Оптимизированное копирование стека - копируем только нужные элементы 
         */
-        if (Query_Stack != NIL)
+        if (Query_Stack != NIL && Query_Stack_Depth > skip_count)
         {
+            int items_to_copy = Query_Stack_Depth - skip_count;
+            int items_copied = 0;
+            int items_skipped = 0;
+            
             stack_copy = NIL;
             
             foreach(lc, Query_Stack)
             {
                 QueryStackEntry *orig_entry = (QueryStackEntry *) lfirst(lc);
                 QueryStackEntry *copy_entry;
+                
+                // Пропускаем первые skip_count элементов
+                if (items_skipped < skip_count)
+                {
+                    items_skipped++;
+                    continue;
+                }
+                
+                // Копируем только нужное количество элементов
+                if (items_copied >= items_to_copy)
+                    break;
         
                 // Выделяем память под новый QueryStackEntry в multi_call_memory_ctx
                 copy_entry = (QueryStackEntry *) palloc(sizeof(QueryStackEntry));
@@ -366,19 +446,7 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
         
                 // Добавляем копию в наш список
                 stack_copy = lappend(stack_copy, copy_entry);
-            }
-            
-            // Пропускаем указанное количество элементов
-            while (depth < skip_count && stack_copy != NIL)
-            {
-                QueryStackEntry *entry = (QueryStackEntry *) linitial(stack_copy);
-        
-                // Освобождаем память под query_text и структуру, так как они больше не нужны
-                pfree(entry->query_text);
-                pfree(entry);
-                stack_copy = list_delete_first(stack_copy);
-                
-                depth++;
+                items_copied++;
             }
 
             /* 
@@ -389,8 +457,11 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
             */
             funcctx->user_fctx = pg_list_reverse_copy(stack_copy);
             
+            /* Очищаем временный список stack_copy - элементы уже скопированы в user_fctx */
+            list_free(stack_copy);
+            
             // Получаем количество уровней стека = по сути кол-во вложенных запросов = а также сколько раз функция будет возвращать данные
-            funcctx->max_calls = list_length((List *) funcctx->user_fctx);
+            funcctx->max_calls = items_copied;
 
             /* 
                 Создаем описание кортежа при первом вызове
@@ -511,6 +582,14 @@ pg_query_stack(PG_FUNCTION_ARGS) // PG_FUNCTION_ARGS — макрос, кото�
     {
         /*
             Когда все результаты уже возвращены (call_cntr >= max_calls):
+            Очищаем скопированный список перед завершением
+        */
+        if (stack != NIL)
+        {
+            pg_stack_list_free_deep(stack);
+        }
+        
+        /*
             - SRF_RETURN_DONE(funcctx); — макрос, который сообщает PostgreSQL, что функция завершила возвращение всех данных.
         */
         SRF_RETURN_DONE(funcctx);

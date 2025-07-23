@@ -1,0 +1,26 @@
+-- Тест 004: Граничные случаи и валидация параметров
+-- Проверим большие значения skip_count
+SELECT COUNT(*) as row_count_1000 FROM pg_query_stack(1000);
+ row_count_1000 
+----------------
+              0
+(1 row)
+
+SELECT COUNT(*) as row_count_100000 FROM pg_query_stack(100000);
+ row_count_100000 
+------------------
+                0
+(1 row)
+
+-- Проверим отрицательные значения (должны трактоваться как 0)
+SELECT frame_number, 
+       CASE 
+           WHEN query_text LIKE '%pg_query_stack(-1)%' THEN 'Contains pg_query_stack(-1) call'
+           ELSE 'Unexpected query: ' || query_text 
+       END as test_result
+FROM pg_query_stack(-1);
+ frame_number |           test_result            
+--------------+----------------------------------
+            0 | Contains pg_query_stack(-1) call
+(1 row)
+
