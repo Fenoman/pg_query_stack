@@ -1,0 +1,26 @@
+-- Тест 001: Базовая установка и проверка расширения
+-- Загружаем расширение
+CREATE EXTENSION IF NOT EXISTS pg_query_stack;
+-- Проверяем, что функция существует
+\df pg_query_stack
+                                               List of functions
+ Schema |      Name      |               Result data type               |      Argument data types      | Type 
+--------+----------------+----------------------------------------------+-------------------------------+------
+ public | pg_query_stack | TABLE(frame_number integer, query_text text) | _skip_count integer DEFAULT 1 | func
+(1 row)
+
+-- Проверяем, что функция pg_self_query существует  
+\df pg_self_query
+                                         List of functions
+ Schema |     Name      |               Result data type               | Argument data types | Type 
+--------+---------------+----------------------------------------------+---------------------+------
+ public | pg_self_query | TABLE(frame_number integer, query_text text) |                     | func
+(1 row)
+
+-- Базовая проверка работоспособности
+SELECT COUNT(*) >= 0 as basic_check FROM pg_query_stack();
+ basic_check 
+-------------
+ t
+(1 row)
+

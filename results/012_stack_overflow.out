@@ -1,0 +1,61 @@
+-- Тест 012: Переполнение стека запросов (MAX_QUERY_STACK_DEPTH)
+-- Этот тест проверяет корректность работы при достижении максимальной глубины стека
+-- Должен корректно обрезать старые записи при превышении лимита
+-- Создаем рекурсивную функцию для генерации глубокого стека
+CREATE OR REPLACE FUNCTION test_deep_recursion
+(
+    depth     int,
+    max_depth int
+)
+    RETURNS table
+            (
+                current_depth int,
+                stack_size    bigint
+            )
+    LANGUAGE plpgsql
+AS
+$$
+DECLARE
+    stack_count bigint;
+BEGIN
+    -- Получаем текущий размер стека
+    SELECT
+        COUNT(*)
+    INTO stack_count
+    FROM pg_query_stack(0);
+
+    -- Возвращаем текущие значения
+    current_depth := depth;
+    stack_size := stack_count;
+    RETURN NEXT;
+
+    -- Если не достигли максимальной глубины, продолжаем рекурсию
+    IF depth < max_depth
+    THEN
+        RETURN QUERY SELECT
+                         *
+                     FROM test_deep_recursion(depth + 1, max_depth);
+    END IF;
+END;
+$$;
+-- Тестируем переполнение стека (создаем 150 уровней вложенности)
+-- Это превышает MAX_QUERY_STACK_DEPTH (100) и должно активировать логику обрезания
+SELECT
+    current_depth,
+    stack_size
+FROM test_deep_recursion(1, 150)
+WHERE current_depth IN (1, 25, 50, 75, 100, 125, 150);
+ current_depth | stack_size 
+---------------+------------
+             1 |          2
+            25 |         26
+            50 |         51
+            75 |         76
+           100 |        100
+           125 |        100
+           150 |        100
+(7 rows)
+
+-- Очистка
+DROP FUNCTION test_deep_recursion(int, int);
+DISCARD ALL;

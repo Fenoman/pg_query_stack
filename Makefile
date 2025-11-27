@@ -2,7 +2,7 @@
 
 MODULES = pg_query_stack
 EXTENSION = pg_query_stack
-EXTVERSION = 1.0.6
+EXTVERSION = 1.1.0
 DATA = $(EXTENSION)--$(EXTVERSION).sql
 PGFILEDESC = "pg_query_stack - tool to get full query stack of current backend"
 CONTROL = pg_query_stack.control
