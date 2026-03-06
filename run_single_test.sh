@@ -21,6 +21,7 @@ if [ $# -eq 0 ]; then
     echo "  013_query_length_limit    - Ограничение длины запроса"
     echo "  014_cte_recursive         - CTE и рекурсивные запросы"
     echo "  015_after_trigger_error_cleanup - Очистка после ошибки в AFTER trigger"
+    echo "  016_swallowed_subxact_trigger_error - swallowed exception во вложенном trigger"
     echo ""
     echo "Примеры:"
     echo "  $0 001_setup"

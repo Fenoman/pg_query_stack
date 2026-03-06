@@ -91,6 +91,14 @@ PG_MODULE_MAGIC;
 #define QUERY_INLINE_BUF_SIZE 512
 
 /*
+ * Максимальная глубина стека подтранзакций, которые мы отслеживаем.
+ *
+ * Нужен для PL/pgSQL EXCEPTION-блоков: они создают внутренние подтранзакции.
+ * 256 уровней более чем достаточно для практических сценариев.
+ */
+#define MAX_SUBXACT_STACK_DEPTH 256
+
+/*
  * Структура для хранения одной записи в стеке запросов.
  *
  * Текст запроса ВСЕГДА копируется — хранить "сырой" указатель на sourceText
@@ -107,6 +115,19 @@ typedef struct QueryStackEntry
     char       *heap_copy;       /* Копия в TopTransactionContext для длинных запросов, иначе NULL */
     char        inline_buf[QUERY_INLINE_BUF_SIZE]; /* Inline-хранилище для коротких запросов */
 } QueryStackEntry;
+
+/*
+ * Снимок состояния стека на входе в подтранзакцию.
+ *
+ * Нужен для корректного восстановления после swallowed exception внутри
+ * PL/pgSQL EXCEPTION-блока: при ABORT_SUB возвращаем стек в это состояние.
+ */
+typedef struct SubXactStackEntry
+{
+    SubTransactionId subxid;
+    int              query_stack_depth;
+    int              query_stack_overflow_depth;
+} SubXactStackEntry;
 
 
 /*
@@ -156,6 +177,10 @@ static int Query_Stack_Depth = 0;
  */
 static int Query_Stack_Overflow_Depth = 0;
 
+/* Стек снимков для вложенных подтранзакций */
+static SubXactStackEntry SubXact_Stack[MAX_SUBXACT_STACK_DEPTH];
+static int              SubXact_Stack_Depth = 0;
+
 /*
  * GUC-переменная для включения/выключения расширения.
  *
@@ -196,6 +221,10 @@ static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 
 /* Callback транзакций */
 static void pg_query_stack_xact_callback(XactEvent event, void *arg);
+static void pg_query_stack_subxact_callback(SubXactEvent event,
+                                            SubTransactionId mySubid,
+                                            SubTransactionId parentSubid,
+                                            void *arg);
 
 /* SQL-функция для получения стека */
 Datum pg_query_stack(PG_FUNCTION_ARGS);
@@ -256,6 +285,21 @@ pg_stack_pop(void)
         }
         Query_Stack[Query_Stack_Depth].query_text = NULL;
     }
+}
+
+/*
+ * Восстановление стека к заданному снимку.
+ *
+ * Используется при откате подтранзакции, когда часть query frame'ов уже
+ * успела попасть в стек, но логически относится к aborted subtransaction.
+ */
+static void
+pg_stack_restore(int target_depth, int target_overflow_depth)
+{
+    while (Query_Stack_Depth > target_depth)
+        pg_stack_pop();
+
+    Query_Stack_Overflow_Depth = target_overflow_depth;
 }
 
 
@@ -320,6 +364,7 @@ _PG_init(void)
      * не вызывается (например, при ошибке на этапе планирования запроса).
      */
     RegisterXactCallback(pg_query_stack_xact_callback, NULL);
+    RegisterSubXactCallback(pg_query_stack_subxact_callback, NULL);
 }
 
 
@@ -340,9 +385,11 @@ _PG_fini(void)
 
     /* Снимаем регистрацию callback */
     UnregisterXactCallback(pg_query_stack_xact_callback, NULL);
+    UnregisterSubXactCallback(pg_query_stack_subxact_callback, NULL);
 
     /* Очищаем стек на случай выгрузки посреди транзакции */
     pg_stack_clear_all();
+    SubXact_Stack_Depth = 0;
 }
 
 
@@ -385,6 +432,67 @@ pg_query_stack_xact_callback(XactEvent event, void *arg)
          */
         Query_Stack_Depth = 0;
         Query_Stack_Overflow_Depth = 0;
+        SubXact_Stack_Depth = 0;
+    }
+}
+
+
+/*
+ * pg_query_stack_subxact_callback — обработчик событий подтранзакций.
+ *
+ * Это критично для PL/pgSQL EXCEPTION-блоков: PostgreSQL откатывает внутреннюю
+ * подтранзакцию, но внешняя транзакция продолжает выполняться. Если не вернуть
+ * стек к состоянию на входе в subxact, "протухшие" frame'ы останутся видимыми
+ * в следующем statement.
+ */
+static void
+pg_query_stack_subxact_callback(SubXactEvent event,
+                                SubTransactionId mySubid,
+                                SubTransactionId parentSubid,
+                                void *arg)
+{
+    int i;
+
+    if (!pg_query_stack_enabled || IsParallelWorker())
+        return;
+
+    switch (event)
+    {
+        case SUBXACT_EVENT_START_SUB:
+            if (SubXact_Stack_Depth < MAX_SUBXACT_STACK_DEPTH)
+            {
+                SubXactStackEntry *entry = &SubXact_Stack[SubXact_Stack_Depth++];
+
+                entry->subxid = mySubid;
+                entry->query_stack_depth = Query_Stack_Depth;
+                entry->query_stack_overflow_depth = Query_Stack_Overflow_Depth;
+            }
+            break;
+
+        case SUBXACT_EVENT_ABORT_SUB:
+            for (i = SubXact_Stack_Depth - 1; i >= 0; i--)
+            {
+                if (SubXact_Stack[i].subxid == mySubid)
+                {
+                    pg_stack_restore(SubXact_Stack[i].query_stack_depth,
+                                     SubXact_Stack[i].query_stack_overflow_depth);
+                    SubXact_Stack_Depth = i;
+                    break;
+                }
+            }
+            break;
+
+        case SUBXACT_EVENT_COMMIT_SUB:
+        case SUBXACT_EVENT_PRE_COMMIT_SUB:
+            for (i = SubXact_Stack_Depth - 1; i >= 0; i--)
+            {
+                if (SubXact_Stack[i].subxid == mySubid)
+                {
+                    SubXact_Stack_Depth = i;
+                    break;
+                }
+            }
+            break;
     }
 }
 

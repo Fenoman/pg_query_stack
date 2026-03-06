@@ -83,6 +83,11 @@
    - Использует `AFTER INSERT` trigger с `RAISE EXCEPTION`, которую ловит внешний `EXCEPTION`
    - Ожидаемый результат: завершившийся `INSERT` не остаётся в стеке
 
+### 016_swallowed_subxact_trigger_error.sql - swallowed exception в nested trigger
+   - Проверяет очистку стека после отката внутренней подтранзакции в `PL/pgSQL EXCEPTION`
+   - Моделирует цепочку `AFTER UPDATE -> INSERT -> AFTER INSERT trigger -> EXCEPTION WHEN OTHERS`
+   - Ожидаемый результат: в следующем statement виден только текущий `pg_query_stack(0)`
+
 ## Запуск тестов
 
 ### Сборка и установка расширения
@@ -158,7 +163,8 @@ test 012_stack_overflow       ... ok
 test 013_query_length_limit   ... ok
 test 014_cte_recursive        ... ok
 test 015_after_trigger_error_cleanup ... ok
-============== All 17 tests passed. ==============
+test 016_swallowed_subxact_trigger_error ... ok
+============== All 18 tests passed. ==============
 ```
 
 ### Ошибки
