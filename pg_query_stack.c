@@ -177,6 +177,7 @@ static bool pg_query_stack_enabled = true;
  * расширениям работать одновременно.
  */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 
@@ -190,6 +191,7 @@ void _PG_fini(void);
 
 /* Хуки выполнения запросов */
 static void pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void pg_query_stack_ExecutorFinish(QueryDesc *queryDesc);
 static void pg_query_stack_ExecutorEnd(QueryDesc *queryDesc);
 
 /* Callback транзакций */
@@ -269,7 +271,7 @@ pg_stack_pop(void)
  *
  * Здесь мы:
  *   1. Регистрируем GUC-переменную для управления расширением
- *   2. Устанавливаем хуки на ExecutorStart и ExecutorEnd
+ *   2. Устанавливаем хуки на ExecutorStart, ExecutorFinish и ExecutorEnd
  *   3. Регистрируем callback для отслеживания завершения транзакций
  */
 void
@@ -305,6 +307,9 @@ _PG_init(void)
     prev_ExecutorStart = ExecutorStart_hook;
     ExecutorStart_hook = pg_query_stack_ExecutorStart;
 
+    prev_ExecutorFinish = ExecutorFinish_hook;
+    ExecutorFinish_hook = pg_query_stack_ExecutorFinish;
+
     prev_ExecutorEnd = ExecutorEnd_hook;
     ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
 
@@ -330,6 +335,7 @@ _PG_fini(void)
 {
     /* Восстанавливаем предыдущие хуки */
     ExecutorStart_hook = prev_ExecutorStart;
+    ExecutorFinish_hook = prev_ExecutorFinish;
     ExecutorEnd_hook = prev_ExecutorEnd;
 
     /* Снимаем регистрацию callback */
@@ -533,6 +539,50 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 
 /*
+ * pg_query_stack_ExecutorFinish — хук фазы завершения выполнения.
+ *
+ * Зачем нужен отдельный хук, если pop уже есть в ExecutorEnd?
+ * -----------------------------------------------------------
+ * Некоторые ошибки возникают раньше ExecutorEnd, в standard_ExecutorFinish():
+ * например, в AFTER trigger. Если такая ошибка перехватывается PL/pgSQL
+ * EXCEPTION-блоком, ExecutorEnd для запроса уже не вызывается, и frame
+ * остаётся в стеке. Здесь мы страхуем только error-path; успешный запрос
+ * по-прежнему снимается в ExecutorEnd.
+ */
+static void
+pg_query_stack_ExecutorFinish(QueryDesc *queryDesc)
+{
+    /* Быстрый выход если отключено или parallel worker */
+    if (!pg_query_stack_enabled || IsParallelWorker())
+    {
+        if (prev_ExecutorFinish)
+            prev_ExecutorFinish(queryDesc);
+        else
+            standard_ExecutorFinish(queryDesc);
+        return;
+    }
+
+    PG_TRY();
+    {
+        if (prev_ExecutorFinish)
+            prev_ExecutorFinish(queryDesc);
+        else
+            standard_ExecutorFinish(queryDesc);
+    }
+    PG_CATCH();
+    {
+        if (Query_Stack_Overflow_Depth > 0)
+            Query_Stack_Overflow_Depth--;
+        else if (Query_Stack_Depth > 0)
+            pg_stack_pop();
+
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+}
+
+
+/*
  * pg_query_stack_ExecutorEnd — хук завершения выполнения запроса.
  *
  * Вызывается после завершения выполнения запроса (успешного или нет).
@@ -545,6 +595,8 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
 {
+    bool need_pop = false;
+
     /* Быстрый выход если отключено или parallel worker */
     if (!pg_query_stack_enabled || IsParallelWorker())
     {
@@ -555,20 +607,38 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
         return;
     }
 
+    need_pop = (Query_Stack_Overflow_Depth > 0 || Query_Stack_Depth > 0);
+
     /*
      * Сначала вызываем предыдущий хук, потом убираем из стека.
      * Это важно: если предыдущий хук вызовет pg_query_stack(),
      * текущий запрос ещё будет в стеке.
      *
-     * PG_TRY не используем: если downstream хук бросит ошибку,
-     * xact callback очистит весь стек при откате транзакции.
-     * В редком случае перехвата ошибки savepoint'ом останется
-     * один «фантомный» элемент — допустимая неточность.
+     * ВАЖНО: standard_ExecutorEnd() может выбросить ошибку, например если
+     * AFTER trigger или downstream хук падает, а ошибка затем перехватывается
+     * PL/pgSQL EXCEPTION-блоком. В этом случае pop всё равно должен выполниться,
+     * иначе завершённый statement "протечёт" в следующий вызов pg_query_stack().
      */
-    if (prev_ExecutorEnd)
-        prev_ExecutorEnd(queryDesc);
-    else
-        standard_ExecutorEnd(queryDesc);
+    PG_TRY();
+    {
+        if (prev_ExecutorEnd)
+            prev_ExecutorEnd(queryDesc);
+        else
+            standard_ExecutorEnd(queryDesc);
+    }
+    PG_CATCH();
+    {
+        if (need_pop)
+        {
+            if (Query_Stack_Overflow_Depth > 0)
+                Query_Stack_Overflow_Depth--;
+            else if (Query_Stack_Depth > 0)
+                pg_stack_pop();
+        }
+
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
     /*
      * Убираем запись из стека.
@@ -577,10 +647,13 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
      * просто декрементируем overflow-счётчик. Иначе снимаем реальный фрейм.
      * Без этой проверки pop снял бы «чужой» фрейм при глубокой рекурсии.
      */
-    if (Query_Stack_Overflow_Depth > 0)
-        Query_Stack_Overflow_Depth--;
-    else if (Query_Stack_Depth > 0)
-        pg_stack_pop();
+    if (need_pop)
+    {
+        if (Query_Stack_Overflow_Depth > 0)
+            Query_Stack_Overflow_Depth--;
+        else if (Query_Stack_Depth > 0)
+            pg_stack_pop();
+    }
 }
 
 

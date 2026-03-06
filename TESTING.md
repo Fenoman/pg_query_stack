@@ -78,6 +78,11 @@
    - Тестирует вложенные CTE в функциях
    - Ожидаемый результат: Корректное отображение CTE в стеке запросов
 
+### 015_after_trigger_error_cleanup.sql - Ошибка в AFTER trigger
+   - Проверяет очистку стека, если ошибка возникает на стадии `ExecutorFinish`
+   - Использует `AFTER INSERT` trigger с `RAISE EXCEPTION`, которую ловит внешний `EXCEPTION`
+   - Ожидаемый результат: завершившийся `INSERT` не остаётся в стеке
+
 ## Запуск тестов
 
 ### Сборка и установка расширения
@@ -152,7 +157,8 @@ test 011_triggers             ... ok
 test 012_stack_overflow       ... ok
 test 013_query_length_limit   ... ok
 test 014_cte_recursive        ... ok
-============== All 16 tests passed. ==============
+test 015_after_trigger_error_cleanup ... ok
+============== All 17 tests passed. ==============
 ```
 
 ### Ошибки
