@@ -1,0 +1,90 @@
+-- Тест 018: SubXactCallback как ЕДИНСТВЕННЫЙ механизм очистки error-path в v2
+--
+-- В v1 за уборку при swallowed exception в AFTER-триггере отвечал
+-- ExecutorFinish-хук с PG_TRY/PG_CATCH. В v2 этот хук удалён, и теперь весь
+-- error-path внутри plpgsql EXCEPTION покрывается ИСКЛЮЧИТЕЛЬНО
+-- SubXactCallback (SUBXACT_EVENT_ABORT_SUB).
+--
+-- Сценарии:
+--   A. Двойная вложенность savepoint'ов: ошибка в самом глубоком уровне,
+--      перехваченная outer EXCEPTION — стек должен быть восстановлен к
+--      состоянию вне обоих savepoint'ов.
+--   B. Ошибка в AFTER trigger из-за CHECK CONSTRAINT, перехваченная
+--      EXCEPTION — стек должен очиститься от фреймов трёх уровней
+--      (внешний UPDATE, AFTER-триггер, нарушенный INSERT).
+
+-- Сценарий A: двойная вложенность EXCEPTION
+DO $outer$
+DECLARE
+    err1 text;
+    err2 text;
+    final_depth int;
+BEGIN
+    BEGIN  -- savepoint 1
+        BEGIN  -- savepoint 2 (внутри savepoint 1)
+            PERFORM 1 / 0;       -- кидает division_by_zero
+        EXCEPTION WHEN division_by_zero THEN
+            err2 := SQLERRM;
+            -- Внутри inner EXCEPTION стек должен видеть outer DO + savepoint
+            PERFORM 1;            -- "оживляем" контекст после abort_sub
+        END;
+        -- После inner EXCEPTION savepoint 2 откатан, мы в savepoint 1
+        PERFORM 1 / 0;           -- кидаем ещё раз для выхода из savepoint 1
+    EXCEPTION WHEN division_by_zero THEN
+        err1 := SQLERRM;
+    END;
+
+    -- После двух последовательных аborts стек должен быть пуст или равен
+    -- глубине внешнего DO. Главное — не "протекли" фреймы из откатанных
+    -- субтранзакций.
+    SELECT count(*) INTO final_depth FROM pg_query_stack(0);
+    RAISE NOTICE 'A: err1=%, err2=%, depth=%', err1 IS NOT NULL, err2 IS NOT NULL, final_depth;
+END;
+$outer$;
+
+-- Сценарий B: AFTER trigger error со swallowed exception
+DROP TABLE IF EXISTS t_a CASCADE;
+DROP TABLE IF EXISTS t_b CASCADE;
+CREATE TABLE t_b (id int CHECK (id > 0));
+CREATE TABLE t_a (id int);
+
+CREATE FUNCTION trg_b_failing() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO t_b VALUES (-1);  -- провалит CHECK
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER trg_after_insert_t_a
+    AFTER INSERT ON t_a
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION trg_b_failing();
+
+CREATE OR REPLACE FUNCTION call_with_swallow() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    err text;
+    qd  int;
+BEGIN
+    BEGIN
+        INSERT INTO t_a VALUES (1);  -- запустит AFTER trigger → CHECK violation
+    EXCEPTION WHEN OTHERS THEN
+        err := SQLERRM;
+    END;
+    -- После swallowed exception стек должен быть очищен от:
+    --   - внешнего INSERT INTO t_a
+    --   - вызова trigger function
+    --   - INSERT INTO t_b
+    -- Должны остаться только фреймы текущего вызова call_with_swallow().
+    SELECT count(*) INTO qd FROM pg_query_stack(0);
+    RETURN format('swallowed=%s, depth_after=%s',
+                  err IS NOT NULL, qd);
+END;
+$$;
+
+SELECT call_with_swallow();
+
+DROP FUNCTION call_with_swallow();
+DROP TRIGGER trg_after_insert_t_a ON t_a;
+DROP FUNCTION trg_b_failing();
+DROP TABLE t_a CASCADE;
+DROP TABLE t_b CASCADE;

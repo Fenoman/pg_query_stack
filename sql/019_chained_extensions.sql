@@ -1,0 +1,69 @@
+-- Тест 019: Совместимость в цепочке хуков с другим расширением
+--
+-- В v2 pop делается ДО вызова downstream-хука в ExecutorEnd. Этот тест
+-- проверяет, что chained-extension (другое расширение со своим
+-- ExecutorEnd-хуком) корректно отрабатывает в этой цепочке.
+--
+-- Используется auto_explain — стандартный contrib-модуль, доступный в
+-- любой PG-инсталляции, который вешается на тот же ExecutorEnd_hook
+-- (вычитывает explain plan перед вызовом downstream).
+--
+-- Загрузка через LOAD внутри теста — auto_explain становится в цепочку
+-- хуков ПОСЛЕ pg_query_stack (LIFO order). Соответственно при выполнении
+-- запроса:
+--   ExecutorStart: auto_explain → pg_query_stack → standard_*
+--   ExecutorEnd:   pg_query_stack → auto_explain → standard_*
+-- (наш pop срабатывает первым, потом auto_explain печатает план; план
+-- отдельная нить, нам важно что цепочка не разрушается).
+
+-- Подгружаем auto_explain в эту сессию
+LOAD 'auto_explain';
+
+-- Конфигурация auto_explain: логировать всё
+SET auto_explain.log_min_duration = 0;
+SET auto_explain.log_nested_statements = on;
+SET auto_explain.log_format = 'text';
+SET auto_explain.log_analyze = off;  -- чтобы не вызвать дополнительные accounting-вычисления
+-- Глушим сам лог в результат теста
+SET client_min_messages = warning;
+
+-- Простая plpgsql-функция для проверки корректности стека под двумя хуками.
+-- Возвращаем только locale-нейтральные метрики (frame_number и длину текста)
+-- чтобы тест не зависел от locale и от точных строк query_text.
+CREATE OR REPLACE FUNCTION chained_test(p int) RETURNS TABLE(frame_number int, qt_len int) LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY
+        SELECT T.frame_number, LENGTH(T.query_text)::int
+        FROM pg_query_stack(0) AS T
+        ORDER BY T.frame_number;
+END;
+$$;
+
+-- Запуск: оба хука должны отработать корректно. Ожидаем 2 фрейма
+-- (top SELECT и внутренний SELECT FROM pg_query_stack), оба с ненулевой
+-- длиной — значит chain не разрушает наш стек.
+SELECT
+    count(*) AS frames,
+    bool_and(qt_len > 0) AS all_nonempty
+FROM chained_test(42);
+
+-- Повторный вызов внутри plpgsql — стек не должен "протечь"
+DO $$
+DECLARE
+    rec record;
+    n int := 0;
+BEGIN
+    FOR rec IN SELECT * FROM chained_test(1) LOOP
+        n := n + 1;
+    END LOOP;
+    RAISE NOTICE 'frames seen: %', n;
+END;
+$$;
+
+-- Cleanup
+DROP FUNCTION chained_test(int);
+RESET auto_explain.log_min_duration;
+RESET auto_explain.log_nested_statements;
+RESET auto_explain.log_format;
+RESET auto_explain.log_analyze;
+RESET client_min_messages;

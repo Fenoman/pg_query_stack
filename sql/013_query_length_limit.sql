@@ -68,8 +68,8 @@ WITH CTE AS (
 SELECT
     CASE
         WHEN LENGTH(query_text) <= 524288 + 15
-            THEN 'OK - длина в пределах лимита'
-        ELSE 'ERROR - превышен лимит длины'
+            THEN 'OK_within_limit'
+        ELSE 'ERR_over_limit'
     END AS status
 FROM pg_query_stack(0) AS T, CTE;
 
@@ -78,8 +78,8 @@ SELECT
     LENGTH('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAtest_long_query') AS normal_query_length,
     CASE
         WHEN query_text LIKE '%test_long_query%'
-            THEN 'OK - обычный запрос полный'
-        ELSE 'ERROR - обычный запрос поврежден'
+            THEN 'OK_full'
+        ELSE 'ERR_truncated'
     END AS normal_query_status
 FROM pg_query_stack(0)
 WHERE frame_number = 0;

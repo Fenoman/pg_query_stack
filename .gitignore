@@ -1,0 +1,24 @@
+# Build artefacts
+*.o
+*.so
+*.dylib
+*.bc
+
+# pg_regress side artefacts (results/ tracked intentionally — committed expected snapshots)
+regression.diffs
+regression.out
+log/
+tmp_check/
+tmp_check_iso/
+output_iso/
+*.bak
+
+# bench output (kept separately by bench/results/.gitignore)
+bench/tools/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

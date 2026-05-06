@@ -1,0 +1,153 @@
+-- Тест 020: Реалистичный сценарий audit-триггера
+--
+-- Образец: trigger_audit_simple/full/data из OmniX_DB. Аудит-триггер
+-- навешивается на BEFORE INSERT/UPDATE/DELETE и через pg_query_stack(0)
+-- захватывает САМ ЗАПРОС, который изменил данные. Это самая
+-- нагруженная и репрезентативная для нашего расширения роль.
+--
+-- Тест проверяет:
+--   1. Прямой INSERT — триггер видит сам этот INSERT (frame 0).
+--   2. INSERT внутри plpgsql функции — триггер видит вызов функции
+--      как top-frame.
+--   3. Bulk INSERT (50 строк) — все 50 срабатываний триггера видят
+--      один и тот же top-level SQL.
+--   4. UPDATE/DELETE — те же гарантии.
+--   5. Стек корректно работает с BEFORE-триггером (имеет вложенность,
+--      lazy materialize должен сработать).
+DROP TABLE IF EXISTS t_audit_log CASCADE;
+NOTICE:  table "t_audit_log" does not exist, skipping
+DROP TABLE IF EXISTS t_data CASCADE;
+NOTICE:  table "t_data" does not exist, skipping
+CREATE TABLE t_audit_log
+(
+    id              serial PRIMARY KEY,
+    captured_query  text,
+    captured_op     text,
+    captured_table  text
+);
+CREATE TABLE t_data
+(
+    id      serial PRIMARY KEY,
+    payload text
+);
+-- BEFORE-триггер: захватывает SQL, который привёл к изменению данных
+CREATE OR REPLACE FUNCTION trg_capture_query() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    top_query text;
+BEGIN
+    SELECT query_text INTO top_query
+    FROM pg_query_stack(0)
+    WHERE frame_number = 0
+    LIMIT 1;
+
+    INSERT INTO t_audit_log(captured_query, captured_op, captured_table)
+    VALUES (top_query, TG_OP, TG_TABLE_NAME);
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
+END;
+$$;
+CREATE TRIGGER trg_t_data
+    BEFORE INSERT OR UPDATE OR DELETE ON t_data
+    FOR EACH ROW
+    EXECUTE FUNCTION trg_capture_query();
+-- Plpgsql-обёртка для сценария 2
+CREATE OR REPLACE FUNCTION do_insert(p text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO t_data(payload) VALUES (p);
+END;
+$$;
+-- ============================================================
+-- Сценарий 1: прямой INSERT
+-- ============================================================
+INSERT INTO t_data(payload) VALUES ('direct1');
+SELECT
+    captured_op,
+    captured_table,
+    captured_query LIKE '%INSERT INTO t_data%' AS captured_marker
+FROM t_audit_log;
+ captured_op | captured_table | captured_marker 
+-------------+----------------+-----------------
+ INSERT      | t_data         | t
+(1 row)
+
+TRUNCATE t_audit_log;
+-- ============================================================
+-- Сценарий 2: INSERT внутри plpgsql функции
+-- ============================================================
+SELECT do_insert('via_func');
+ do_insert 
+-----------
+ 
+(1 row)
+
+SELECT
+    captured_op,
+    captured_table,
+    captured_query LIKE '%do_insert%' AS captured_marker
+FROM t_audit_log;
+ captured_op | captured_table | captured_marker 
+-------------+----------------+-----------------
+ INSERT      | t_data         | t
+(1 row)
+
+TRUNCATE t_audit_log;
+-- ============================================================
+-- Сценарий 3: bulk INSERT (50 строк)
+-- ============================================================
+INSERT INTO t_data(payload)
+SELECT 'bulk_' || g
+FROM generate_series(1, 50) g;
+-- Все 50 срабатываний триггера должны видеть ОДИН И ТОТ ЖЕ top-level SQL
+SELECT
+    count(*)               AS total_audit_rows,
+    count(DISTINCT captured_query) AS unique_top_queries,
+    bool_and(captured_query LIKE '%generate_series%') AS all_match_marker
+FROM t_audit_log;
+ total_audit_rows | unique_top_queries | all_match_marker 
+------------------+--------------------+------------------
+               50 |                  1 | t
+(1 row)
+
+TRUNCATE t_audit_log;
+-- ============================================================
+-- Сценарий 4: UPDATE
+-- ============================================================
+UPDATE t_data SET payload = payload || '_upd';
+SELECT
+    captured_op,
+    count(*) AS rows_updated,
+    count(DISTINCT captured_query) AS unique_top_queries,
+    bool_and(captured_query LIKE '%UPDATE t_data%') AS all_match_marker
+FROM t_audit_log
+GROUP BY captured_op;
+ captured_op | rows_updated | unique_top_queries | all_match_marker 
+-------------+--------------+--------------------+------------------
+ UPDATE      |           52 |                  1 | t
+(1 row)
+
+TRUNCATE t_audit_log;
+-- ============================================================
+-- Сценарий 5: DELETE
+-- ============================================================
+DELETE FROM t_data WHERE payload LIKE 'bulk_%';
+SELECT
+    captured_op,
+    count(*) > 0 AS rows_deleted,
+    bool_and(captured_query LIKE '%DELETE FROM t_data%') AS all_match_marker
+FROM t_audit_log
+GROUP BY captured_op;
+ captured_op | rows_deleted | all_match_marker 
+-------------+--------------+------------------
+ DELETE      | t            | t
+(1 row)
+
+-- Cleanup
+DROP TRIGGER trg_t_data ON t_data;
+DROP FUNCTION do_insert(text);
+DROP FUNCTION trg_capture_query();
+DROP TABLE t_data CASCADE;
+DROP TABLE t_audit_log CASCADE;

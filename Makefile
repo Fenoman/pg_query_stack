@@ -8,7 +8,7 @@ PGFILEDESC = "pg_query_stack - tool to get full query stack of current backend"
 CONTROL = pg_query_stack.control
 
 # Regression tests
-REGRESS = 001_setup 002_basic_functionality 003_skip_parameters 004_edge_cases 005_nested_calls_default 006_nested_calls_full 007_error_recovery 008_subtransactions 009_complex_nesting 010_loop 011_triggers 012_stack_overflow 013_query_length_limit 014_cte_recursive 015_after_trigger_error_cleanup 016_swallowed_subxact_trigger_error
+REGRESS = 001_setup 002_basic_functionality 003_skip_parameters 004_edge_cases 005_nested_calls_default 006_nested_calls_full 007_error_recovery 008_subtransactions 009_complex_nesting 010_loop 011_triggers 012_stack_overflow 013_query_length_limit 014_cte_recursive 015_after_trigger_error_cleanup 016_swallowed_subxact_trigger_error 017_lazy_materialize_deep 018_subxact_only_cleanup 019_chained_extensions 020_audit_trigger_realistic
 REGRESS_OPTS = --inputdir=. --outputdir=. --dbname=regression_pg_query_stack
 
 PG_CONFIG = pg_config

@@ -1,6 +1,12 @@
 -- Тест 014: CTE и рекурсивные запросы
 -- Этот тест проверяет корректность работы с Common Table Expressions
--- включая рекурсивные CTE и вложенные CTE
+-- включая рекурсивные CTE и вложенные CTE.
+--
+-- LOCALE-AGNOSTIC NOTE: query_text НЕ выводится напрямую, потому что
+-- сами SQL-тексты содержат русские комментарии ("-- Базовый случай")
+-- и при печати столбца psql считает ширину в БАЙТАХ под LC_ALL=C
+-- и в СИМВОЛАХ под UTF-8. Вместо вывода query_text проверяем его
+-- через LENGTH() и LIKE — оба возвращают locale-нейтральные значения.
 -- Рекурсивный CTE тест 1
 WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
                                                         -- Базовый случай
@@ -68,14 +74,17 @@ FROM fibonacci;
         34 |                       1
 (10 rows)
 
--- Рекурсивный CTE тест 3
-WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
+-- Рекурсивный CTE тест 3 (locale-agnostic: вместо вывода query_text
+-- проверяем его длину и наличие маркера)
+WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1, frame_number, qt_len, qt_has_marker) AS (
                                                         -- Базовый случай
                                                         SELECT
                                                             1,
                                                             0::bigint,
                                                             1::bigint,
-                                                            T.*
+                                                            T.frame_number,
+                                                            LENGTH(T.query_text),
+                                                            T.query_text LIKE '%RECURSIVE fibonacci%'
                                                         FROM pg_query_stack(0) AS T
                                                         UNION ALL
                                                         -- Рекурсивный случай
@@ -83,236 +92,46 @@ WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (
                                                             n + 1,
                                                             fib_n_plus_1,
                                                             fib_n + fib_n_plus_1,
-                                                            T.*
+                                                            T.frame_number,
+                                                            LENGTH(T.query_text),
+                                                            T.query_text LIKE '%RECURSIVE fibonacci%'
                                                         FROM fibonacci, pg_query_stack(0) AS T
                                                         WHERE n < 10
                                                     )
 SELECT
-    *
+    n,
+    fib_n,
+    fib_n_plus_1,
+    frame_number,
+    qt_len > 0 AS qt_nonempty,
+    qt_has_marker
 FROM fibonacci;
- n  | fib_n | fib_n_plus_1 | frame_number |                                           query_text                                           
-----+-------+--------------+--------------+------------------------------------------------------------------------------------------------
-  1 |     0 |            1 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  2 |     1 |            1 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  3 |     1 |            2 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  4 |     2 |            3 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  5 |     3 |            5 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  6 |     5 |            8 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  7 |     8 |           13 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  8 |    13 |           21 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
-  9 |    21 |           34 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
- 10 |    34 |           55 |            0 | WITH RECURSIVE fibonacci(n, fib_n, fib_n_plus_1) AS (                                         +
-    |       |              |              |                                                         -- Базовый случай                     +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             1,                                +
-    |       |              |              |                                                             0::bigint,                        +
-    |       |              |              |                                                             1::bigint,                        +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM pg_query_stack(0) AS T           +
-    |       |              |              |                                                         UNION ALL                             +
-    |       |              |              |                                                         -- Рекурсивный случай                 +
-    |       |              |              |                                                         SELECT                                +
-    |       |              |              |                                                             n + 1,                            +
-    |       |              |              |                                                             fib_n_plus_1,                     +
-    |       |              |              |                                                             fib_n + fib_n_plus_1,             +
-    |       |              |              |                                                             T.*                               +
-    |       |              |              |                                                         FROM fibonacci, pg_query_stack(0) AS T+
-    |       |              |              |                                                         WHERE n < 10                          +
-    |       |              |              |                                                     )                                         +
-    |       |              |              | SELECT                                                                                        +
-    |       |              |              |     *                                                                                         +
-    |       |              |              | FROM fibonacci;
+ n  | fib_n | fib_n_plus_1 | frame_number | qt_nonempty | qt_has_marker 
+----+-------+--------------+--------------+-------------+---------------
+  1 |     0 |            1 |            0 | t           | t
+  2 |     1 |            1 |            0 | t           | t
+  3 |     1 |            2 |            0 | t           | t
+  4 |     2 |            3 |            0 | t           | t
+  5 |     3 |            5 |            0 | t           | t
+  6 |     5 |            8 |            0 | t           | t
+  7 |     8 |           13 |            0 | t           | t
+  8 |    13 |           21 |            0 | t           | t
+  9 |    21 |           34 |            0 | t           | t
+ 10 |    34 |           55 |            0 | t           | t
 (10 rows)
 
--- Вложенные CTE
+-- Вложенные CTE (locale-agnostic — query_text не печатаем, только длины и
+-- булевы флаги наличия ожидаемых подстрок)
 CREATE OR REPLACE FUNCTION test_nested_cte ()
     RETURNS table
             (
                 outer_value int,
                 frame_number_in int,
-                query_text_in text,
+                qt_in_len int,
+                qt_in_has_marker boolean,
                 frame_number int,
-                query_text text
+                qt_len int,
+                qt_has_marker boolean
             )
     LANGUAGE plpgsql
 AS
@@ -330,9 +149,12 @@ BEGIN
                                     )
                  SELECT
                      ic.outer_id::int,
-                     ic.frame_number AS  frame_number_in,
-                     ic.query_text AS query_text_in,
-                     T.*
+                     ic.frame_number AS frame_number_in,
+                     LENGTH(ic.query_text) AS qt_in_len,
+                     ic.query_text LIKE '%test_nested_cte%' AS qt_in_has_marker,
+                     T.frame_number,
+                     LENGTH(T.query_text) AS qt_len,
+                     T.query_text LIKE '%test_nested_cte%' AS qt_has_marker
                  FROM inner_cte ic, pg_query_stack(0) AS T
                  LIMIT 1;
 END;
@@ -340,11 +162,9 @@ $$;
 SELECT
     *
 FROM test_nested_cte();
- outer_value | frame_number_in |      query_text_in      | frame_number |       query_text        
--------------+-----------------+-------------------------+--------------+-------------------------
-           1 |               0 | SELECT                 +|            0 | SELECT                 +
-             |                 |     *                  +|              |     *                  +
-             |                 | FROM test_nested_cte(); |              | FROM test_nested_cte();
+ outer_value | frame_number_in | qt_in_len | qt_in_has_marker | frame_number | qt_len | qt_has_marker 
+-------------+-----------------+-----------+------------------+--------------+--------+---------------
+           1 |               0 |        36 | t                |            0 |     36 | t
 (1 row)
 
 -- Очистка
