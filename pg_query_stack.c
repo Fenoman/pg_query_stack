@@ -336,22 +336,38 @@ materialize_frame(QueryStackEntry *entry)
     }
 
     /*
-     * strnlen вместо strlen: не сканируем дальше лимита обрезки.
-     * Для обычных запросов (<512KB) — идентично strlen.
-     * Для гигантских запросов — экономия на бесполезном сканировании.
+     * Быстрый путь: пробуем уложить запрос в inline-буфер за один проход.
+     *
+     * memccpy(dst, src, '\0', n) копирует байты из src в dst, пока не
+     * встретит '\0' или не скопирует n байт. Возвращает указатель на байт
+     * ПОСЛЕ скопированного '\0' при успехе, либо NULL — если NUL не нашёлся
+     * в первых n байтах (запрос длиннее буфера). Это заменяет пару
+     * strnlen+memcpy одним проходом по тексту.
+     *
+     * Важно (легко выстрелить себе в ногу):
+     *
+     * 1. heap_copy присваиваем ЛИТЕРАЛЬНО entry->inline_buf, а не возврат
+     *    memccpy. pg_stack_pop отличает inline-буфер от heap-аллокации
+     *    сравнением указателей: если heap_copy == &entry->inline_buf[0] —
+     *    это inline, иначе вызывается pfree(heap_copy). Возврат memccpy
+     *    указывает внутрь inline_buf (на байт после NUL), и pfree на эту
+     *    середину стекового буфера → SIGSEGV / порча кучи.
+     *
+     * 2. На NULL проваливаемся в путь ниже, где strnlen сканирует src,
+     *    а НЕ inline_buf. После неудачного memccpy буфер заполнен
+     *    частичной копией без NUL-терминатора — strnlen прочёл бы за
+     *    границы буфера (UB).
      */
+    if (memccpy(entry->inline_buf, src, '\0', INLINE_BUF_SIZE) != NULL)
+    {
+        entry->heap_copy = entry->inline_buf;
+        return;
+    }
+
+    /* Холодный путь: запрос > INLINE_BUF_SIZE-1 байт */
     len = strnlen(src, MAX_QUERY_TEXT_LENGTH + 1);
 
-    if (len <= INLINE_BUF_SIZE - 1)
-    {
-        /*
-         * Быстрый путь материализации: запрос помещается в inline-буфер.
-         * Никаких аллокаций — только memcpy в статическую память кадра.
-         */
-        memcpy(entry->inline_buf, src, len + 1);
-        entry->heap_copy = entry->inline_buf;
-    }
-    else if (len > MAX_QUERY_TEXT_LENGTH)
+    if (len > MAX_QUERY_TEXT_LENGTH)
     {
         /*
          * Запрос слишком длинный — обрезаем.
