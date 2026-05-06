@@ -255,6 +255,16 @@ static bool pg_query_stack_active = true;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorEnd_hook_type   prev_ExecutorEnd   = NULL;
 
+/*
+ * Заранее вычисленные цели цепочки, закэшированные на момент _PG_init.
+ * Вызовы на горячем пути идут через них вместо условного шаблона
+ * "prev_* ? prev_* : standard_*". После _PG_init считаются неизменными
+ * и никогда не переприсваиваются в рантайме. _PG_fini защитно сбрасывает
+ * их в NULL.
+ */
+static ExecutorStart_hook_type chained_ExecutorStart = NULL;
+static ExecutorEnd_hook_type   chained_ExecutorEnd   = NULL;
+
 
 /* ============================================================================
  * ПРОТОТИПЫ ФУНКЦИЙ
@@ -493,10 +503,17 @@ _PG_init(void)
      * работу других расширений.
      */
     prev_ExecutorStart = ExecutorStart_hook;
-    ExecutorStart_hook = pg_query_stack_ExecutorStart;
+    prev_ExecutorEnd   = ExecutorEnd_hook;
 
-    prev_ExecutorEnd = ExecutorEnd_hook;
-    ExecutorEnd_hook = pg_query_stack_ExecutorEnd;
+    chained_ExecutorStart = prev_ExecutorStart
+                              ? prev_ExecutorStart
+                              : standard_ExecutorStart;
+    chained_ExecutorEnd   = prev_ExecutorEnd
+                              ? prev_ExecutorEnd
+                              : standard_ExecutorEnd;
+
+    ExecutorStart_hook = pg_query_stack_ExecutorStart;
+    ExecutorEnd_hook   = pg_query_stack_ExecutorEnd;
 
     /*
      * Регистрируем callback'и для отслеживания завершения транзакций.
@@ -529,6 +546,8 @@ _PG_fini(void)
     /* Восстанавливаем предыдущие хуки */
     ExecutorStart_hook = prev_ExecutorStart;
     ExecutorEnd_hook   = prev_ExecutorEnd;
+    chained_ExecutorStart = NULL;
+    chained_ExecutorEnd   = NULL;
 
     /* Снимаем регистрацию callback'ов */
     UnregisterXactCallback(pg_query_stack_xact_callback, NULL);
@@ -715,10 +734,7 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
      */
     if (unlikely(!pg_query_stack_active))
     {
-        if (prev_ExecutorStart)
-            prev_ExecutorStart(queryDesc, eflags);
-        else
-            standard_ExecutorStart(queryDesc, eflags);
+        chained_ExecutorStart(queryDesc, eflags);
         return;
     }
 
@@ -747,10 +763,7 @@ pg_query_stack_ExecutorStart(QueryDesc *queryDesc, int eflags)
      * чистить нечего, и PG_TRY не нужен. Этот паттерн используют
      * pg_stat_statements и auto_explain.
      */
-    if (prev_ExecutorStart)
-        prev_ExecutorStart(queryDesc, eflags);
-    else
-        standard_ExecutorStart(queryDesc, eflags);
+    chained_ExecutorStart(queryDesc, eflags);
 
     /*
      * Добавляем запрос в стек (если есть место).
@@ -819,10 +832,7 @@ pg_query_stack_ExecutorEnd(QueryDesc *queryDesc)
             pg_stack_pop();
     }
 
-    if (prev_ExecutorEnd)
-        prev_ExecutorEnd(queryDesc);
-    else
-        standard_ExecutorEnd(queryDesc);
+    chained_ExecutorEnd(queryDesc);
 }
 
 
