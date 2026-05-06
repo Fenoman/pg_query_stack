@@ -17,7 +17,6 @@
 -- отдельная нить, нам важно что цепочка не разрушается).
 -- Подгружаем auto_explain в эту сессию
 LOAD 'auto_explain';
-ERROR:  could not access file "auto_explain": No such file or directory
 -- Конфигурация auto_explain: логировать всё
 SET auto_explain.log_min_duration = 0;
 SET auto_explain.log_nested_statements = on;
