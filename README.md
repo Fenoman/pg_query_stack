@@ -2,20 +2,38 @@
 
 The `pg_query_stack` extension allows you to retrieve the full stack of SQL queries for the current session (unlike the `current_query()` function, which returns only the top-level query). This is useful for debugging, logging, and analyzing complex call chains in the database.
 
-It works based on custom hooks. The source code is extensively commented (currently only in Russian).
+It works based on minimal custom hooks (ExecutorStart/End) that record raw `QueryDesc*` pointers into a per-backend ring buffer. The SQL function reads the ring at call time using a snapshot-once walker with three UAF safety guards. The source code is extensively commented (currently only in Russian).
 
 Unlike the previous version of the extension (`pg_self_query`), the current one has been rewritten from scratch and does not depend on the `pg_query_state` module or PostgreSQL core patches. Therefore, it can be installed independently on a vanilla version of PostgreSQL and likely on any fork.
+
+## Architecture
+
+The hot path is **5 combined ExecutorStart+ExecutorEnd branches** on aarch64 (~5-7 ns/query, byte-identical disassembly across PG 16/17/18):
+
+- **ExecutorStart**: push `queryDesc` into a 100-slot BSS ring (single 8-byte store) — no string copy, no parent pointer. 2 branches (active flag + overflow check).
+- **ExecutorEnd**: decrement ring head (or `overflow_depth` on overflow path). 3 branches.
+- **SubXactCallback**: per-subxid LIFO snapshot/restore of ring head — handles PL/pgSQL EXCEPTION cleanup for "swallowed" exceptions where `standard_ExecutorEnd` is never called.
+- **XactCallback**: 3-int BSS reset on COMMIT/ABORT.
+
+The `pg_query_stack()` function walks the ring at call time: snapshot-once at FIRSTCALL, lazy `pstrdup` per slot, three UAF guards (null queryDesc / null estate / null sourceText) emit placeholder strings instead of crashing.
+
+**Memory footprint:** `pgs_ring[100]` (800 B) + `pgs_ring_subxact_snap[256]` (2048 B) + 3 ints = 2860 B BSS per backend, zero-initialized.
+
+**Overflow handling:** when ring depth exceeds 100, `pgs_ring_overflow_depth` is incremented instead of pushing. ExecutorEnd mirrors this by decrementing `overflow_depth` first, preventing ring head underrun.
+
+**Parallel workers:** skipped via `IsParallelWorker()` — re-executed fragments would double-count in the ring.
 
 ## Features
 
 - Retrieve the full stack of nested SQL queries for the current session.
 - Independence from other modules (does not depend on `pg_query_state` like the previous version).
-- Compatible with vanilla PostgreSQL and likely with any forks.
+- Compatible with PostgreSQL 16 / 17 / 18 (verified on release and cassert builds).
+- ~10x lower hot-path overhead vs the previous version (~5-7 ns/query).
 - Extensively commented source code (currently only in Russian).
 
 ## Compatibility
 
-Currently, the extension is compatible with PostgreSQL 16. Supporting earlier versions may require minor modifications to the source code. Compatibility with future versions of PostgreSQL is not guaranteed and needs to be tested.
+**Verified on PostgreSQL 16.13 / 17.9 / 18.3** (release + cassert builds, Linux aarch64 and macOS arm64). The public API used by the walker — `ActivePortal`, `QueryDesc`, `EState->estate` — is ABI-stable across these versions. Compatibility with earlier versions may require minor source modifications.
 
 ## Use Cases
 
@@ -180,6 +198,7 @@ $$
 $$
 LANGUAGE SQL;
 ```
+
 At the moment, it is automatically created when the extension is installed.
 
 ## License

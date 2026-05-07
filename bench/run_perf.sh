@@ -115,7 +115,7 @@ perf record -F "$PERF_FREQ" --call-graph dwarf,4096 -p "$BPID" \
 # top symbols: полный отчёт в topsymbols_full.txt, отфильтрованный — в topsymbols.txt
 perf report -i "$out_dir/perf.data" --stdio --no-children -F overhead,symbol 2>/dev/null \
     > "$out_dir/topsymbols_full.txt" || true
-grep -iE 'pg_query_stack|standard_Executor|sigsetjmp|__memcpy|memcpy@plt|strnlen|MemoryContextAlloc|materialize_frame' \
+grep -iE 'pg_query_stack|standard_Executor|sigsetjmp|__memcpy|memcpy@plt|strnlen|MemoryContextAlloc' \
     "$out_dir/topsymbols_full.txt" > "$out_dir/topsymbols.txt" || true
 
 echo "[perf] top symbols (filtered):"

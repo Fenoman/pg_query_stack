@@ -1,0 +1,76 @@
+-- Тест 024: AFTER DELETE STATEMENT + REFERENCING + pg_self_query()
+--
+-- Аналог теста 023, но для DELETE. В audit.trigger_audit_data
+-- триггер навешивается на UPDATE и DELETE — оба варианта должны
+-- одинаково корректно захватывать top-level запрос.
+--
+-- Тест проверяет:
+--   1. Триггер срабатывает на AFTER DELETE STATEMENT
+--   2. Захваченный текст начинается с DELETE и содержит имя таблицы
+--   3. captured_frame = 0 (top-level DELETE)
+--   4. Переходная таблица OLD TABLE доступна (имитация audit pattern)
+
+DROP TABLE IF EXISTS t024_data CASCADE;
+DROP TABLE IF EXISTS t024_log CASCADE;
+
+CREATE TABLE t024_data
+(
+    link int PRIMARY KEY,
+    val  text
+);
+
+CREATE TABLE t024_log
+(
+    captured_query  text,
+    captured_frame  int,
+    captured_op     text,
+    deleted_count   int
+);
+
+INSERT INTO t024_data VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+-- Точная копия паттерна audit.trigger_audit_data + использование переходной таблицы
+CREATE OR REPLACE FUNCTION t024_capture() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    _query_text  text;
+    _frame       int;
+    _del_count   int;
+BEGIN
+    SELECT X.query_text, X.frame_number
+    INTO _query_text, _frame
+    FROM public.pg_self_query() X
+    ORDER BY X.frame_number DESC
+    LIMIT 1;
+
+    -- Используем переходную таблицу deleted (как в OmniX-аудите)
+    SELECT count(*) INTO _del_count FROM deleted;
+
+    INSERT INTO t024_log VALUES (_query_text, _frame, TG_OP, _del_count);
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER t024_after_delete
+    AFTER DELETE ON t024_data
+    REFERENCING OLD TABLE AS deleted
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION t024_capture();
+
+-- ============================================================
+-- Сценарий: top-level DELETE с условием (удалит 2 строки)
+-- ============================================================
+DELETE FROM t024_data WHERE link IN (2, 3);
+
+SELECT
+    captured_op,
+    captured_frame,
+    captured_query LIKE 'DELETE%'    AS starts_with_delete,
+    captured_query LIKE '%t024_data%' AS contains_table_name,
+    deleted_count                     AS rows_seen_via_transition
+FROM t024_log;
+
+-- Cleanup
+DROP TRIGGER t024_after_delete ON t024_data;
+DROP FUNCTION t024_capture();
+DROP TABLE t024_data;
+DROP TABLE t024_log;

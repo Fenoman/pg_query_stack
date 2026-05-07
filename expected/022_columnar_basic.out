@@ -1,0 +1,54 @@
+-- Тест 022: Корректность walker при работе с Citus columnar таблицами
+--
+-- Проверяет что pg_query_stack() корректно захватывает фреймы стека внутри
+-- запросов к columnar-таблицам (единственная фича Citus, используемая в проде).
+--
+-- Если citus_columnar не установлен — тест пропускается без ошибки.
+-- Всегда возвращает ровно одну строку 'columnar_test_complete' — для детерминизма
+-- независимо от того, установлен ли citus_columnar или нет.
+-- Ветка PRESENT: проверяет stack_size >= 1, при провале RAISE EXCEPTION.
+-- Ветка ABSENT: RAISE NOTICE (подавляется WARNING), завершается без ошибки.
+-- и возвращает тот же фиксированный статус.
+SET client_min_messages = WARNING;
+-- Пытаемся подключить citus_columnar; если недоступен — молча пропускаем.
+DO $$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS citus_columnar;
+EXCEPTION WHEN OTHERS THEN
+    NULL;  -- extension absent or load error: silently skip
+END $$;
+-- Блок проверки: всегда возвращает 'columnar_test_complete'.
+-- PRESENT: проверяет глубину стека внутри columnar-запроса, RAISE при ошибке.
+-- ABSENT: логирует NOTICE (подавляется) и завершается без ошибки.
+DO $$
+DECLARE
+    has_columnar boolean;
+    stack_size   int;
+BEGIN
+    SELECT EXISTS(SELECT 1 FROM pg_am WHERE amname = 'columnar') INTO has_columnar;
+
+    IF NOT has_columnar THEN
+        RAISE NOTICE 'columnar AM not available: skipping stack depth check';
+    ELSE
+        CREATE TEMP TABLE t_col (id int, val text) USING columnar;
+        INSERT INTO t_col SELECT g, 'row_' || g FROM generate_series(1, 100) g;
+
+        SELECT COUNT(*) INTO stack_size
+        FROM pg_query_stack(0) AS qs
+        WHERE EXISTS (SELECT 1 FROM t_col WHERE id = 1);
+
+        DROP TABLE t_col;
+
+        IF stack_size IS NULL OR stack_size < 1 THEN
+            RAISE EXCEPTION 'columnar stack check failed: stack_size=%', stack_size;
+        END IF;
+    END IF;
+END $$;
+SELECT 'columnar_test_complete' AS status;
+         status         
+------------------------
+ columnar_test_complete
+(1 row)
+
+RESET client_min_messages;
+DISCARD ALL;

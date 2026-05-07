@@ -1,7 +1,5 @@
 #!/bin/bash
-
-# Скрипт для запуска отдельного теста pg_query_stack
-
+# Запуск одного регрессионного теста по имени
 if [ $# -eq 0 ]; then
     echo "Использование: $0 <имя_теста>"
     echo ""
@@ -15,17 +13,21 @@ if [ $# -eq 0 ]; then
     echo "  007_error_recovery        - Восстановление после ошибок"
     echo "  008_subtransactions       - Подтранзакции"
     echo "  009_complex_nesting       - Сложные вложения и временные таблицы"
-    echo "  010_loop                  - Нагрузочный тест с циклом 1000 итераций"
+    echo "  010_loop                  - Нагрузочный тест с циклом"
     echo "  011_triggers              - Работа с триггерами"
     echo "  012_stack_overflow        - Переполнение стека"
-    echo "  013_query_length_limit    - Ограничение длины запроса"
+    echo "  013_query_length_limit    - Длинные запросы"
     echo "  014_cte_recursive         - CTE и рекурсивные запросы"
-    echo "  015_after_trigger_error_cleanup - Очистка после ошибки в AFTER trigger"
-    echo "  016_swallowed_subxact_trigger_error - swallowed exception во вложенном trigger"
-    echo "  017_lazy_materialize_deep - глубокая вложенность (5 уровней) — проверка lazy materialize invariant"
-    echo "  018_subxact_only_cleanup  - SubXactCallback как единственный механизм cleanup в v2"
-    echo "  019_chained_extensions    - chain compatibility с auto_explain (другой ExecutorEnd hook)"
-    echo "  020_audit_trigger_realistic - реалистичный audit-trigger по образцу OmniX_DB"
+    echo "  015_after_trigger_error_cleanup - Очистка после ошибки AFTER"
+    echo "  016_swallowed_subxact_trigger_error - Перехваченные исключения"
+    echo "  017_lazy_materialize_deep - Глубокая вложенность (5+ уровней)"
+    echo "  018_subxact_only_cleanup  - Очистка субтранзакций"
+    echo "  019_chained_extensions    - Совместимость с другими хуками"
+    echo "  020_audit_trigger_realistic - Реалистичный audit-trigger"
+    echo "  022_columnar_basic         - Совместимость с Citus columnar"
+    echo "  023_audit_after_update_pg_self_query - AFTER UPDATE STATEMENT + pg_self_query"
+    echo "  024_audit_after_delete_pg_self_query - AFTER DELETE STATEMENT + pg_self_query"
+    echo "  025_audit_nested_function_deepest_visible - UPDATE внутри функции (deepest frame)"
     echo ""
     echo "Примеры:"
     echo "  $0 001_setup"
@@ -35,35 +37,26 @@ fi
 
 TEST_NAME=$1
 
-# Проверяем, существует ли тест
 if [ ! -f "sql/${TEST_NAME}.sql" ]; then
-    echo "Ошибка: Тест ${TEST_NAME} не найден!"
-    echo "Файл sql/${TEST_NAME}.sql не существует."
+    echo "Ошибка: Тест ${TEST_NAME} не найден (sql/${TEST_NAME}.sql)"
     exit 1
 fi
 
-echo "=== Запуск теста: ${TEST_NAME} ==="
+echo "=== Запуск: ${TEST_NAME} ==="
 echo ""
 
-# Запускаем конкретный тест
 make installcheck REGRESS="${TEST_NAME}"
 
 echo ""
 if [ -f "regression.diffs" ]; then
-    echo "=== ТЕСТ НЕ ПРОШЕЛ - Различия найдены ==="
+    echo "=== ОШИБКА: найдены различия ==="
     cat regression.diffs
     exit 1
 else
-    echo "=== ТЕСТ ПРОШЕЛ УСПЕШНО ==="
+    echo "=== ОК: тест прошел ==="
 fi
 
-# Показываем результат, если он есть
 if [ -f "results/${TEST_NAME}.out" ]; then
     echo ""
-    echo "=== Результат теста ==="
-    echo "Файл: results/${TEST_NAME}.out"
-    echo "Размер: $(wc -l < results/${TEST_NAME}.out) строк"
-    echo ""
-    echo "Для просмотра полного результата выполните:"
-    echo "cat results/${TEST_NAME}.out"
+    echo "Результат: results/${TEST_NAME}.out ($(wc -l < results/${TEST_NAME}.out) строк)"
 fi
